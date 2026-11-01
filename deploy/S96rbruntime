@@ -1,0 +1,5 @@
+#!/bin/sh
+# Install manually as /etc/init.d/S96rbruntime on Buildroot.
+set -eu
+BASE=${RB_RUNTIME_HOME:-/root/rb-r1}
+exec "$BASE/scripts/service.sh" "$@"

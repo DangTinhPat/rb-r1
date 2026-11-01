@@ -1,0 +1,25 @@
+{
+  "backend": "rknn",
+  "realtime_priority": 20,
+  "transport": "serial",
+  "socket": "/tmp/rb-hybrid-runtime.sock",
+  "serial_port": "/dev/ttyS2",
+  "baud": 921600,
+  "status_file": "/tmp/rb-hybrid-status.json",
+  "telemetry_timeout_ms": 30,
+  "target_ack_timeout_ms": 30,
+  "inference_deadline_ms": 10,
+  "inference_hard_deadline_ms": 15,
+  "max_consecutive_deadline_misses": 3,
+  "home_hold_s": 3.0,
+  "warmup_start_s": 12.5,
+  "handoff_earliest_s": 13.0,
+  "warmup_steps": 50,
+  "home_joints": [
+    2.35706715,
+    2.35706715,
+    0.0,
+    0.0
+  ],
+  "home_tolerance_rad": 0.15
+}

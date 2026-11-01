@@ -1,0 +1,10 @@
+{
+  "source_onnx_sha256": "bfb8097f9240193e9075ee8afe283baeebdeb7ddeb84f98e87cd0a44b3e7c993",
+  "normalizer_matches_onnx": true,
+  "sha256": {
+    "models/model_19500.onnx": "bfb8097f9240193e9075ee8afe283baeebdeb7ddeb84f98e87cd0a44b3e7c993",
+    "models/beni512_dfp16.rknn": "4e5b1dd4dd7da232e3055b0307e578089f7fd647a100ea41f67a2f499eea26f1",
+    "models/beni512_19500_normalizer.json": "01af3f48db1aaff31140a144b49325a224de472d03f41274fbe8aca98058d362"
+  },
+  "quantization": "DFP16"
+}
