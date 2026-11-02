@@ -1,4 +1,4 @@
 {
-    "cmake.sourceDirectory": "${workspaceFolder}",
-    "python.analysis.extraPaths": ["${workspaceFolder}/src"]
+    "cmake.sourceDirectory": "${workspaceFolder}/highlv",
+    "python.analysis.extraPaths": ["${workspaceFolder}/highlv/src"]
 }

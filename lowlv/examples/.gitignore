@@ -1,0 +1,6 @@
+# Credentials thật chỉ nằm trên máy; chỉ commit các file *.example.*
+.pio/
+__pycache__/
+*.py[cod]
+wifi_secrets.h
+secrets.local*.ini

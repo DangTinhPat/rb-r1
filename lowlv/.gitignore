@@ -1,0 +1,6 @@
+.pio/
+.local/
+__pycache__/
+*.py[cod]
+include/gateway/secrets/HcrWifiSecrets.hpp
+include/gateway/secrets/OtaSecrets.hpp
