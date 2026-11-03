@@ -128,7 +128,7 @@ HcrFrame decode(const WirePacket& packet) {
   for(unsigned i=0;i<packet.size;++i)n+=hcr_feed(&p,packet.bytes[i],&f);
   assert(n==1);return f;
 }
-void gatewayIntegration() {
+void gatewayIntegration(bool release_joints=false) {
   Rig r;r.home();GatewayCore core(r.motor);
   HcrFrame f{};f.type=HCR_HELLO;f.size=12;f.seq=1;f.stamp_us=1;
   hcr_put32(f.payload,7);hcr_put16(f.payload+4,200);hcr_put16(f.payload+6,100);hcr_put32(f.payload+8,HCR_SCHEMA);
@@ -140,7 +140,8 @@ void gatewayIntegration() {
   hcr_put32(f.payload,7);hcr_put32(f.payload+4,2);core.receive(f,r.now);
   unsigned seq=3;std::uint64_t next=0;bool saw_pending=false,saw_applied=false;
   const auto start=r.now;std::uint64_t first_ack=0;
-  for(unsigned i=0;i<300;++i) {
+  for(unsigned i=0;i<(release_joints?1200U:300U);++i) {
+    const auto iteration_start=r.now;
     sensor();
     if(r.now>=next) {
       auto sample=decode(core.telemetry(r.now));
@@ -150,11 +151,25 @@ void gatewayIntegration() {
       } else saw_pending=true;
       f={};f.type=HCR_TARGET;f.size=52;f.seq=seq++;f.stamp_us=r.now;
       hcr_put32(f.payload,7);hcr_put32(f.payload+4,sample.seq);
-      hcr_put16(f.payload+8,HCR_HOME_PD);hcr_put16(f.payload+10,3);
+      hcr_put16(f.payload+8,release_joints?HCR_RECOVERY:HCR_HOME_PD);
+      hcr_put16(f.payload+10,release_joints && i>=600 && i<800 ? 0 : 3);
       for(unsigned j=0;j<4;++j)hcr_putfloat(f.payload+12+j*4,2.35706715F);
       core.receive(f,r.now);next=r.now+5000;
     }
-    r.workers();r.now+=500;
+    if (release_joints) {
+      const auto mid_io=[&](){sensor();assert(core.diagnostics(r.now).fault==LocalFault::None);};
+      r.left.hook=mid_io;r.right.hook=mid_io;
+    }
+    r.workers();
+    if (release_joints && i>=100) {
+      // Service still runs during each wait. No extra worker step between
+      // 200 Hz batches: released feedback must not rely on background slots.
+      assert(r.now-iteration_start<5000);
+      while(r.now<iteration_start+5000) {
+        r.now=std::min(r.now+500,iteration_start+5000);sensor();
+        assert(core.diagnostics(r.now).fault==LocalFault::None);
+      }
+    } else r.now+=500;
     assert(core.diagnostics(r.now).fault==LocalFault::None);
   }
   assert(saw_pending&&saw_applied);
@@ -165,6 +180,7 @@ void gatewayIntegration() {
   for(auto on:r.right.enabled)assert(!on);
   std::printf("PASS: GatewayCore -> async two-bus backend -> applied ACK; nominal first ACK %llu us\n",
               static_cast<unsigned long long>(first_ack-start));
+  if(release_joints) std::puts("PASS: GatewayCore >5 s stream includes 1 s joint release and re-enable without sensor fault");
 }
 void peer() {
   Rig r; r.left.latency=r.right.latency=0;
@@ -201,6 +217,84 @@ void peer() {
 }
 int main(int argc,char** argv) {
   if(argc>1 && !std::strcmp(argv[1],"--peer")){peer();return 0;}
+
+  { // Kneeling releases joints while TARGETs continue at 200 Hz. A worker
+    // may have a batch on every step, so background polling is not guaranteed.
+    for (unsigned flags : {0U,2U}) {
+      Rig r;r.home();auto t=r.target();unsigned seq=1;r.run(t,seq);
+      MotorApplied a{};r.motor.apply(t,seq,r.now+20000,r.now,a);
+      t.profile=HCR_RECOVERY;t.flags=flags;
+      r.left.latency=r.right.latency=200;
+      r.left.frames.clear();r.right.frames.clear();
+      for (unsigned tick=0;tick<200;++tick) {
+        const auto start=r.now;
+        if (!r.motor.feedback(r.now).encoders_valid) {
+          const auto state=r.motor.diagnostics();
+          std::fprintf(stderr,"released TARGET flags=%u tick=%u hip_age=%llu knee_age=%llu wheel_age=%llu us\n",
+            flags,tick,static_cast<unsigned long long>(r.now-state.leg[0].stamp[0]),
+            static_cast<unsigned long long>(r.now-state.leg[0].stamp[1]),
+            static_cast<unsigned long long>(r.now-state.leg[0].stamp[2]));
+        }
+        assert(r.motor.feedback(r.now).encoders_valid);
+        assert(r.motor.apply(t,++seq,r.now+20000,r.now,a)!=ApplyResult::Fault);
+        const auto previous=a.seq;
+        for (auto* bus:{&r.left,&r.right}) for(auto& position:bus->position) ++position;
+        r.lw.step();
+        assert(r.motor.apply(t,seq,r.now+20000,r.now,a)!=ApplyResult::Fault);
+        assert(a.seq==previous); // never ACK only the left bus
+        r.rw.step();
+        assert(r.motor.apply(t,seq,r.now+20000,r.now,a)==ApplyResult::Applied);
+        assert(a.seq==seq);
+        const auto feedback=r.motor.feedback(r.now);
+        for (unsigned side=0;side<2;++side) {
+          const auto& bus=side?r.right:r.left;
+          const auto state=r.motor.diagnostics().leg[side];
+          for(unsigned j=0;j<3;++j) {
+            assert(state.stamp[j]>=start);
+            assert(feedback.encoder_stamp_us[2*j+side]==state.stamp[j]);
+          }
+          for(unsigned j=0;j<2;++j) close(state.raw_q[j],bus.position[j]*6.283185307F/16384);
+        }
+        for (auto* bus:{&r.left,&r.right}) {
+          assert(!bus->enabled[0] && !bus->enabled[1]);
+          assert(bus->enabled[2]==bool(flags&2U));
+        }
+        assert(r.now-start<5000);r.now=start+5000;
+      }
+      for (auto* bus:{&r.left,&r.right}) for (const auto& frame:bus->frames)
+        assert(!(frame[2]!=1 && frame[4]==3 && frame[5]==0x1a));
+      // Catching can subsequently re-enable the same joints without losing HOME.
+      t.flags=3;r.run(t,seq);
+      assert(r.motor.feedback(r.now).homed);
+      for (auto* bus:{&r.left,&r.right}) for (bool on:bus->enabled) assert(on);
+    }
+    std::puts("PASS: continuous 200 Hz released-joint batches retain all six real samples and two-bus ACK");
+  }
+
+  { // The released-joint PING is real I/O: failure/cancellation/expiry cannot
+    // fabricate feedback or complete a batch, even with torque already OFF.
+    for (unsigned side:{0U,1U}) for (unsigned id:{2U,3U})
+      for (unsigned failure=0;failure<5;++failure) {
+        Rig r;r.home();auto t=r.target();unsigned seq=1;r.run(t,seq);
+        t.flags=0;r.run(t,seq);MotorApplied a{};
+        r.motor.apply(t,seq,r.now+20000,r.now,a);const auto previous=a.seq;
+        auto& bus=side?r.right:r.left;auto& worker=side?r.rw:r.lw;
+        const auto stamp=r.motor.diagnostics().leg[side].stamp[id-2];
+        if(failure==0 || failure==1) {
+          bus.fail_id=id;bus.fail_inst=1;
+          bus.injected_error=failure==0?BusError::ReplyTimeout:BusError::ReplyInvalid;
+        } else if(failure==2) bus.status=0x20;
+        else if(failure==3) bus.hook=[&](){r.motor.disable();};
+        else bus.latency=21000;
+        r.motor.apply(t,++seq,r.now+20000,r.now,a);worker.step();
+        const auto d=r.motor.diagnostics();
+        assert(d.leg[side].stamp[id-2]==stamp);
+        assert(!d.in_flight && a.seq==previous);
+        if(failure!=3) assert(d.error!=MotorError::None);
+        for (auto on:bus.enabled) assert(!on);
+      }
+    std::puts("PASS: released feedback rejects missing/corrupt/status replies, cancellation and expired I/O");
+  }
 
   { // Supplier's corrected golden MIT packet, independent of the mock.
     std::array<std::uint8_t,48> out{};
@@ -244,6 +338,36 @@ int main(int argc,char** argv) {
     assert(left_after==r.left.frames.size() && right_after==r.right.frames.size());
     f=r.motor.feedback(r.now);close(f.q[0],2.35706715F);
     assert(r.motor.disabled() && !core.diagnostics(r.now).armed);
+  }
+  { // Wheel write goes first only once a completed MIT batch holds the legs.
+    const auto first_mit=[](const FakeBus& bus,std::size_t from) {
+      for(std::size_t i=from;i<bus.frames.size();++i){const auto& f=bus.frames[i];if(f[4]==3&&f[5]==0x1a)return i;}
+      return bus.frames.size();};
+    const auto first_wheel=[](const FakeBus& bus,std::size_t from) {
+      for(std::size_t i=from;i<bus.frames.size();++i){const auto& f=bus.frames[i];
+        if(f[2]==1&&f[4]==3&&f[5]==0x20&&signed16(f,6)!=0)return i;}
+      return bus.frames.size();};
+    { // legs engaged by a prior zero-wheel batch: wheel first, on both buses
+      Rig r;r.home();auto t=r.target();unsigned seq=1;r.run(t,seq);
+      t.profile=HCR_POLICY_PD;t.target[4]=10;t.target[5]=-23;
+      const auto lfrom=r.left.frames.size(),rfrom=r.right.frames.size();
+      ++seq;r.run(t,seq);
+      const auto lw=first_wheel(r.left,lfrom),lm=first_mit(r.left,lfrom);
+      const auto rw=first_wheel(r.right,rfrom),rm=first_mit(r.right,rfrom);
+      assert(lw<r.left.frames.size() && lm<r.left.frames.size() && lw<lm);
+      assert(rw<r.right.frames.size() && rm<r.right.frames.size() && rw<rm);
+      assert(signed16(r.left.last(1,0x20),6)==95 && signed16(r.right.last(1,0x20),6)==220);
+    }
+    { // first batch of a session keeps legs before wheels
+      Rig r;r.home();auto t=r.target(HCR_POLICY_PD);t.target[4]=10;t.target[5]=-23;
+      const auto lfrom=r.left.frames.size(),rfrom=r.right.frames.size();
+      unsigned seq=1;r.run(t,seq);
+      const auto lw=first_wheel(r.left,lfrom),lm=first_mit(r.left,lfrom);
+      const auto rw=first_wheel(r.right,rfrom),rm=first_mit(r.right,rfrom);
+      assert(lm<r.left.frames.size() && rm<r.right.frames.size());
+      assert(lw>lm && rw>rm);
+    }
+    std::puts("PASS: wheel command precedes joint blocks only after the legs are held");
   }
   { Rig r;assert(r.motor.disabled()&&!r.motor.ready());r.home();
     auto f=r.motor.feedback(r.now);close(f.q[0],2.35706715F);close(f.q[2],0);assert(!f.torque_valid);
@@ -563,8 +687,10 @@ int main(int argc,char** argv) {
     assert(r.motor.diagnostics().leg[0].failed_instruction==2);
   }
   { // Readback recovery cannot extend the original 20 ms batch deadline.
+    // The wheel write precedes the joint blocks once the legs are held, so the
+    // wheel I/O alone must exceed the budget for the deadline to land on it.
     Rig r;r.home();auto t=r.target();unsigned seq=1;r.run(t,seq);
-    r.left.fail_id=1;r.left.fail_addr=0x20;r.left.fail_inst=3;r.left.latency=6000;
+    r.left.fail_id=1;r.left.fail_addr=0x20;r.left.fail_inst=3;r.left.latency=12000;
     t.target[4]=3;
     ++seq;MotorApplied a{};r.motor.apply(t,seq,r.now+20000,r.now,a);r.workers();
     assert(r.motor.diagnostics().error==MotorError::Expired && r.motor.disabled());
@@ -768,5 +894,6 @@ int main(int argc,char** argv) {
   std::puts("PASS: Lumi mapping/gains, direct-knee and crank adapters, verified configuration/enable, no-write-reply wheel");
   std::puts("PASS: bounded retry, first failure retained, cancellation/expiry and wheel dedup/keepalive/freshness");
   gatewayIntegration();
+  gatewayIntegration(true);
   std::puts("PASS: golden codec, calibrated side/sign/units, physical joint FF, quantized applied targets, startup, both-bus ACK, unwrap/freshness, range, expiry, cancellation, write/enable loss, reset, gain/status/CRC faults");
 }

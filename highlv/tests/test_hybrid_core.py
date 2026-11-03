@@ -175,10 +175,40 @@ class StateTests(unittest.TestCase):
         r = Rig()
         r.control("ARM")
         r.telemetry()
-        for _ in range(8):
+        for _ in range(20):
             r.ack = (r.core.tx_seq + 999) & 0xFFFFFFFF
             r.telemetry()
-        self.assertEqual(r.core.reason, "ack_timeout")
+        self.assertTrue(r.core.reason.startswith("no applied ACK for"))
+
+    def test_ack_window_covers_wheel_reenable_settle_but_stays_bounded(self):
+        r = Rig()
+        r.control("ARM")
+        r.telemetry()
+        r.telemetry()  # acknowledge the first HOME target before simulating re-enable
+        last_ack = r.core.last_ack
+        # Kneeling-to-Catching can spend 25 ms re-enabling and settling wheels,
+        # then needs one worker cycle and a telemetry return for its ACK.
+        for _ in range(8):  # 40 ms: longer than settle plus observed batch latency
+            r.ack = last_ack
+            r.telemetry()
+            self.assertNotEqual(r.core.mode, "FAULT", r.core.reason)
+        self.assertEqual(r.core.last_ack, last_ack)
+        r.ack = r.core.sent_targets[-1]
+        r.telemetry()
+        self.assertEqual(r.core.mode, "HOME")
+        self.assertNotEqual(r.core.last_ack, last_ack)
+
+        failed = Rig()
+        failed.control("ARM")
+        failed.telemetry()
+        failed.telemetry()
+        last_ack = failed.core.last_ack
+        for _ in range(13):  # 65 ms without any valid applied sequence
+            failed.ack = last_ack
+            failed.telemetry()
+        self.assertTrue(failed.core.reason.startswith("no applied ACK for"))
+        self.assertIn("telemetry applied_seq=", failed.core.reason)
+        self.assertIn("newest_sent_seq=", failed.core.reason)
 
     def test_mcu_reboot_starts_new_epoch_despite_old_sequence(self):
         r = Rig()

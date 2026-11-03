@@ -9,7 +9,7 @@ import socket
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "command", choices=("ARM", "DISARM", "RESET", "ESTOP", "VELOCITY", "RESET_ENCODERS")
+        "command", choices=("ARM", "DISARM", "RESET", "ESTOP", "VELOCITY", "RESET_ENCODERS", "CAL_IMU")
     )
     parser.add_argument("values", nargs="*")
     parser.add_argument("--socket", default="/tmp/rb-hybrid-command.sock")

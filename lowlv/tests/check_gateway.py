@@ -157,6 +157,12 @@ def main():
                         str(ROOT/'tests/gateway_tests.cpp'),
                         '-o',str(binary)],check=True)
         subprocess.run([str(binary)],check=True)
+        schedule = Path(directory)/'task-schedule-tests'
+        subprocess.run(['g++','-std=c++17','-Wall','-Wextra','-Werror','-O1','-g',
+                        '-fsanitize=address,undefined','-fno-omit-frame-pointer',
+                        '-I'+str(ROOT/'include'), str(ROOT/'tests/task_schedule_tests.cpp'),
+                        '-o',str(schedule)],check=True)
+        subprocess.run([str(schedule)],check=True)
         check_bench_peer(binary)
         if args.runtime:
             check_interop(binary,args.runtime.resolve())

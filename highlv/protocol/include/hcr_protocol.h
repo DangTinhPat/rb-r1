@@ -45,6 +45,9 @@ enum { HCR_ENCODER_HOME=131, HCR_ENCODER_HOME_ACK=5 };
 enum { HCR_HOME_APPLIED=1, HCR_HOME_NOT_OFF=2, HCR_HOME_FEEDBACK=3, HCR_HOME_REFUSED=4 };
 // Request payload: epoch:u32, source_seq:u32 (8B).
 // Reply: epoch:u32, request frame seq:u32, result:u32 (12B).
+enum { HCR_CAL_IMU=132, HCR_CAL_IMU_ACK=7 };
+enum { HCR_CAL_IMU_ACCEPTED=1, HCR_CAL_IMU_NOT_OFF=2, HCR_CAL_IMU_FEEDBACK=3,
+       HCR_CAL_IMU_REFUSED=4, HCR_CAL_IMU_BUSY=5 };
 
 enum {
   HCR_IMU_OK = 1,

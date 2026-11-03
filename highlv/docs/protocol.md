@@ -37,12 +37,15 @@ Frame replay/cũ/sai epoch không làm mới watchdog. Timestamp TELEMETRY là l
 | `0x03` | TELEMETRY | MCU → LF |
 | `0x05` | ENCODER_HOME_ACK | MCU → LF |
 | `0x06` | EXECUTION_DIAG (tùy chọn) | MCU → LF |
+| `0x07` | CAL_IMU_ACK | MCU → LF |
 | `0x81` | TARGET | LF → MCU |
 | `0x82` | STATUS | LF → MCU |
 | `0x83` | ENCODER_HOME | LF → MCU |
+| `0x84` | CAL_IMU | LF → MCU |
 
-ARM/DISARM/RESET/ESTOP/VELOCITY là lệnh qua command socket local của runtime,
-không có message CONTROL trong HCR1 hiện tại.
+Operator gửi ARM/DISARM/RESET/ESTOP/VELOCITY/CAL_IMU qua command socket local;
+socket này không phải frame HCR1. Runtime chuyển riêng RESET_ENCODERS và CAL_IMU
+thành request HCR1 chuyên biệt. HCR1 không có message CONTROL tổng quát.
 
 ## 2. HELLO và phiên điều khiển
 
@@ -154,7 +157,15 @@ Mode: 0 WAIT_LINK, 1 DISARMED, 2 HOME, 3 STANDUP, 4 WARMUP, 5 MODEL, 6 FAULT.
 | 11 | Telemetry handler >15 ms khi đang điều khiển |
 | 12 | Applied ACK quá hạn |
 
-LF timeout telemetry/ACK 30 ms. Policy chạy 100 Hz theo lịch tuyệt đối.
+LF vẫn giữ telemetry timeout 30 ms. Cửa sổ ACK thích ứng từ 30 ms tới mức trần
+60 ms trong `config/runtime.json`: runtime học latency ACK đầu-cuối từ các
+`applied_seq` tiến triển gần nhất; ở pha `Catching`, cộng thêm thời gian ổn định
+bánh 25 ms và chu kỳ bus mới nhất (hoặc dự phòng 15 ms nếu chẩn đoán đã cũ).
+Biên 8 ms bù jitter; chẩn đoán bus chỉ dùng khi mới hơn 500 ms. Timeout ghi
+sequence, tuổi ACK và cửa sổ đã chọn khi hết hạn. Cơ chế không đổi TTL TARGET
+20 ms, source age hay yêu cầu ACK từ cả hai bus. Trạng thái LF công bố cửa sổ,
+tuổi ACK và số mẫu latency trong `ack_diagnostics`.
+Policy chạy 100 Hz theo lịch tuyệt đối.
 Inference >10 ms: bỏ prediction, giữ reference trước, hidden vẫn cập nhật.
 Inference >15 ms hoặc 3 lần trễ liên tiếp: FAULT. Không handoff bằng prediction muộn.
 Thông tin chi tiết, latency và counter được ghi thêm vào status JSON của LF.
@@ -188,6 +199,17 @@ Sau reply thành công, LF gửi disabled, tạo epoch mới rồi bắt tay v�
 không tự ARM. LF chỉ nhận reply khớp epoch/request đang chờ. Sau 1 s chưa có
 reply, UI báo chưa xác nhận; không tự gửi lại khi timeout hoặc reconnect.
 Firmware cũ không hỗ trợ request sẽ hết thời gian chờ; phải cập nhật cả hai tầng.
+
+### Calib IMU khi Disable: CAL_IMU (0x84), CAL_IMU_ACK (0x07)
+
+Nút web **Calib IMU · giữ yên** gửi một request LF → ESP với payload `<II>`:
+`epoch:u32, source_seq:u32` của TELEMETRY mới (≤30 ms). ESP chỉ nhận khi không
+armed/enabled, cả hai bus đã xác nhận OFF, telemetry nguồn mới và không có lỗi
+driver/E-stop. ACK `<III>` gồm epoch, request sequence và kết quả: `1` đã nhận;
+`2` motor chưa OFF; `3` telemetry cũ; `4` trạng thái không cho phép; `5` đang
+calib. ACK chỉ xác nhận bắt đầu. ESP thu tối thiểu 500 mẫu trong ít nhất 1 s;
+LF báo hoàn tất khi IMU_VALID xuất hiện, hoặc lỗi nếu chưa hợp lệ sau 5 s.
+Lệnh không di chuyển chân, không xóa lỗi driver/E-stop và không tự ARM.
 
 ## 6. Codec đối chiếu và firmware thật
 

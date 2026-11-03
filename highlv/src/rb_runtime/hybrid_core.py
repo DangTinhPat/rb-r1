@@ -60,6 +60,8 @@ class HybridCore:
         self.last_ack_rx = self.last_ack = None
         self.first_target_seq = None
         self.sent_targets = deque(maxlen=32)
+        self.sent_target_at = {}
+        self.ack_latency_ms = deque(maxlen=32)
         self.support, self.phase = False, "Idle"
         self.action, self.velocity = [0.0] * 6, [0.0, 0.0]
         self.target = [0.0] * 6
@@ -74,6 +76,7 @@ class HybridCore:
         self.last_command_error = None
         self.encoder_source = None
         self.encoder_reset = {"state":"idle", "message":"Chưa chụp HOME trong phiên này"}
+        self.imu_calibration = {"state":"idle", "message":"Chưa yêu cầu calib IMU trong phiên này"}
 
     def frame(self, kind, payload):
         seq = self.tx_seq
@@ -91,7 +94,7 @@ class HybridCore:
             ),
         )
 
-    def output(self, seq, profile=0, flags=0, target=None, ff=None):
+    def output(self, seq, profile=0, flags=0, target=None, ff=None, sent_at=None):
         """Send 4 absolute hip/crank angles + 2 wheel angular rates.
 
         ff is hipL/hipR/kneeL/kneeR angular velocity feedforward for recovery.
@@ -110,7 +113,10 @@ class HybridCore:
         if profile and self.first_target_seq is None:
             self.first_target_seq = frame.seq
         if profile:
+            if len(self.sent_targets) == self.sent_targets.maxlen:
+                self.sent_target_at.pop(self.sent_targets[0], None)
             self.sent_targets.append(frame.seq)
+            self.sent_target_at[frame.seq] = time.monotonic() if sent_at is None else sent_at
         return frame
 
     def fail(self, name, detail=""):
@@ -123,9 +129,77 @@ class HybridCore:
         self.mode = "FAULT"
         return self.output(self.rx_seq or 0)
 
+    def _target_ack_window_ms(self, now):
+        """Estimate a bounded ACK window from recent applied latency and phase."""
+        floor_ms = self.config.get("target_ack_timeout_min_ms", 30)
+        ceiling_ms = self.config["target_ack_timeout_ms"]
+        margin_ms = self.config.get("target_ack_latency_margin_ms", 8)
+        samples = sorted(self.ack_latency_ms)
+        if samples:
+            if len(samples) < 8:
+                observed_ms = samples[-1]
+            else:
+                observed_ms = samples[math.ceil(0.9 * len(samples)) - 1]
+            estimate_ms = observed_ms + margin_ms
+        else:
+            observed_ms = 0.0
+            estimate_ms = floor_ms
+
+        if self.phase == "Catching":
+            settle_ms = self.config.get("target_ack_wheel_settle_ms", 25)
+            diag_max_age_ms = self.config.get("target_ack_diag_max_age_ms", 500)
+            diag_age_ms = (
+                float("inf") if self.mcu_diagnostics_rx is None
+                else max(0.0, 1000 * (now - self.mcu_diagnostics_rx))
+            )
+            if self.mcu_diagnostics is not None and diag_age_ms <= diag_max_age_ms:
+                diag = self.mcu_diagnostics
+                cycle_ms = max(
+                    diag.get("cycle_l_us", 0), diag.get("cycle_r_us", 0),
+                    diag.get("cycle_l_max_us", 0), diag.get("cycle_r_max_us", 0),
+                ) / 1000.0
+            else:
+                cycle_ms = self.config.get("target_ack_unknown_cycle_ms", 15)
+            estimate_ms = max(estimate_ms, settle_ms + max(cycle_ms, observed_ms) + margin_ms)
+
+        return max(floor_ms, min(ceiling_ms, estimate_ms))
+
+    def _target_ack_timeout_detail(self, applied_seq, now):
+        """Track applied progress and fault only after the adaptive ACK window.
+
+        MCU TARGET TTL and telemetry freshness remain independent hard limits.
+        """
+        if self.first_target_seq is None:
+            return None
+
+        if applied_seq in self.sent_targets and (
+            self.last_ack is None or p.newer(applied_seq, self.last_ack)
+        ):
+            sent_at = self.sent_target_at.get(applied_seq)
+            if sent_at is not None and now >= sent_at:
+                self.ack_latency_ms.append(1000 * (now - sent_at))
+            self.last_ack, self.last_ack_rx = applied_seq, now
+
+        ack_age = now - self.last_ack_rx if self.last_ack_rx is not None else float("inf")
+        timeout_ms = self._target_ack_window_ms(now)
+        if ack_age <= timeout_ms / 1000:
+            return None
+
+        newest_sent = self.sent_targets[-1] if self.sent_targets else None
+        return (
+            f"no applied ACK for {1000*ack_age:.1f} ms "
+            f"(adaptive window {timeout_ms:.1f} ms); "
+            f"telemetry applied_seq={applied_seq}, last_ack_seq={self.last_ack}, "
+            f"newest_sent_seq={newest_sent}"
+        )
+
     def watchdog(self, now):
         if self.encoder_reset["state"] == "pending" and now - self.encoder_reset["sent_at"] > 1.0:
             self.encoder_reset = {"state":"error", "message":"ESP chưa xác nhận Reset encoder; không tự gửi lại. Kiểm tra firmware/link."}
+        if self.imu_calibration["state"] == "pending" and now - self.imu_calibration["sent_at"] > 1.0:
+            self.imu_calibration = {"state":"error", "message":"ESP chưa xác nhận yêu cầu calib IMU; không tự gửi lại."}
+        if self.imu_calibration["state"] == "running" and now - self.imu_calibration["started_at"] > 5.0:
+            self.imu_calibration = {"state":"error", "message":"IMU chưa hợp lệ sau 5 s; giữ robot đứng yên rồi thử calib lại."}
         if self.mode in ("HOME", "STANDUP", "WARMUP", "MODEL"):
             if (
                 self.last_rx is None
@@ -143,7 +217,7 @@ class HybridCore:
                 return [disabled, self.hello(), self.status()]
             self.counters["rejected"] += 1
             return []
-        if frame.kind not in (p.HELLO_ACK, p.TELEMETRY, p.ENCODER_HOME_ACK, p.EXECUTION_DIAG):
+        if frame.kind not in (p.HELLO_ACK, p.TELEMETRY, p.ENCODER_HOME_ACK, p.CAL_IMU_ACK, p.EXECUTION_DIAG):
             self.counters["rejected"] += 1
             return []
         if (
@@ -188,14 +262,35 @@ class HybridCore:
                 if result == p.HOME_APPLIED:
                     # This button explicitly resets the software reference and LF
                     # session. MCU local fault latch/HOME remain untouched by epoch.
+                    imu_calibration = self.imu_calibration.copy()
                     disabled = self.output(self.rx_seq or 0)
                     self.new_epoch()
                     self.encoder_reset = {"state":"done", "message":"ESP đã chụp HOME. Giữ Disable; ARM là thao tác riêng."}
+                    self.imu_calibration = imu_calibration
                     return [disabled, self.hello(), self.status()]
                 messages = {p.HOME_NOT_OFF:"ESP chưa xác nhận đủ 6 motor OFF; bấm Disable và đợi.",
                             p.HOME_FEEDBACK:"Feedback encoder cũ hoặc thiếu; chưa chụp HOME.",
                             p.HOME_REFUSED:"ESP từ chối: encoder còn chuyển động, bus/lỗi hoặc chưa OFF."}
                 self.encoder_reset = {"state":"error", "message":messages.get(result,"Kết quả Reset encoder không hợp lệ")}
+                return []
+            if frame.kind == p.CAL_IMU_ACK:
+                _, request_seq, result = p.CAL_IMU_ACK_DATA.unpack(frame.payload)
+                if (self.imu_calibration["state"] != "pending" or
+                    request_seq != self.imu_calibration["request_seq"]):
+                    self.counters["rejected"] += 1
+                    return []
+                if result == p.CAL_IMU_ACCEPTED:
+                    self.imu_calibration = {"state":"running", "started_at":now,
+                                            "message":"ESP đang lấy mẫu IMU; giữ robot đứng yên."}
+                else:
+                    messages = {
+                        p.CAL_IMU_NOT_OFF:"Calib IMU bị từ chối: chưa xác nhận motor OFF.",
+                        p.CAL_IMU_FEEDBACK:"Calib IMU bị từ chối: telemetry đã cũ.",
+                        p.CAL_IMU_BUSY:"ESP đang xử lý một yêu cầu calib khác.",
+                        p.CAL_IMU_REFUSED:"ESP từ chối calib IMU ở trạng thái hiện tại.",
+                    }
+                    self.imu_calibration = {"state":"error",
+                                            "message":messages.get(result,"Kết quả calib IMU không hợp lệ.")}
                 return []
             if frame.kind == p.HELLO_ACK:
                 if p.HELLO_DATA.unpack(frame.payload) != (
@@ -224,13 +319,14 @@ class HybridCore:
         self.last_command_error = None
         if not math.isfinite(vx) or not math.isfinite(wz):
             raise ValueError("nonfinite command")
-        if op not in ("ARM", "DISARM", "RESET", "VELOCITY", "RESET_ENCODERS"):
+        if op not in ("ARM", "DISARM", "RESET", "VELOCITY", "RESET_ENCODERS", "CAL_IMU"):
             self.counters["rejected"] += 1
             return [self.status()]
         if op == "RESET_ENCODERS":
             if (not self.link or self.mode not in ("DISARMED", "FAULT") or
                 (self.mode == "FAULT" and self.fault != FAULTS["invalid_telemetry"]) or
-                self.encoder_reset["state"] == "pending" or self.encoder_source is None or
+                self.encoder_reset["state"] == "pending" or
+                self.imu_calibration["state"] in ("pending", "running") or self.encoder_source is None or
                 not 0 <= now-self.encoder_source[1] <= .03 or
                 not (self.last_telemetry_flags or 0) & p.ENCODER_OK or
                 (self.last_telemetry_flags or 0) & (p.ESTOP | p.DRIVER_FAULT)):
@@ -240,6 +336,21 @@ class HybridCore:
             request = self.frame(p.ENCODER_HOME, p.ENCODER_HOME_DATA.pack(self.epoch,self.encoder_source[0]))
             self.encoder_reset = {"state":"pending", "request_seq":request.seq, "sent_at":now,
                                   "message":"Đang chờ ESP xác nhận chụp HOME; không tự bật motor."}
+            return [request]
+        if op == "CAL_IMU":
+            flags = self.last_telemetry_flags or 0
+            if (not self.link or self.mode not in ("DISARMED", "FAULT") or
+                (self.mode == "FAULT" and self.fault != FAULTS["invalid_telemetry"]) or
+                self.encoder_reset["state"] == "pending" or
+                self.imu_calibration["state"] in ("pending", "running") or
+                self.encoder_source is None or not 0 <= now-self.encoder_source[1] <= .03 or
+                not flags & p.ENCODER_OK or flags & (p.ESTOP | p.DRIVER_FAULT)):
+                self.counters["rejected"] += 1
+                self.last_command_error = "Calib IMU: cần link/telemetry mới, Disable, encoder hợp lệ và không có E-stop/lỗi driver."
+                return [self.status()]
+            request = self.frame(p.CAL_IMU, p.CAL_IMU_DATA.pack(self.epoch,self.encoder_source[0]))
+            self.imu_calibration = {"state":"pending", "request_seq":request.seq,
+                                    "sent_at":now, "message":"Đang chờ ESP nhận yêu cầu calib IMU."}
             return [request]
         if op == "RESET":
             disabled = self.output(self.rx_seq or 0)
@@ -253,9 +364,10 @@ class HybridCore:
                 self.logic.reset()
             self.velocity = [0.0, 0.0]
             return [self.output(self.rx_seq or 0), self.status()]
-        if op == "ARM" and self.encoder_reset["state"] == "pending":
+        if op == "ARM" and (self.encoder_reset["state"] == "pending" or
+                             self.imu_calibration["state"] in ("pending", "running")):
             self.counters["rejected"] += 1
-            self.last_command_error = "ARM: đang chờ ESP xác nhận Reset encoder"
+            self.last_command_error = "ARM: đang chờ ESP hoàn tất calib IMU hoặc chụp HOME"
             return [self.status()]
         if op == "ARM" and self.mode == "DISARMED":
             if (
@@ -282,6 +394,8 @@ class HybridCore:
             self.next_infer_stamp = None
             self.first_target_seq = self.last_ack = self.last_ack_rx = None
             self.sent_targets.clear()
+            self.sent_target_at.clear()
+            self.ack_latency_ms.clear()
             self.action, self.velocity = [0.0] * 6, [0.0, 0.0]
             self.support, self.phase, self.handoff_us = False, "Idle", None
             self.mode = "HOME"
@@ -302,6 +416,8 @@ class HybridCore:
         t = p.Telemetry.decode(frame.payload)
         self.last_telemetry_flags = t.flags
         self.encoder_source = (frame.seq, now)
+        if self.imu_calibration["state"] == "running" and t.flags & p.IMU_OK:
+            self.imu_calibration = {"state":"done", "message":"IMU đã hiệu chuẩn và đang hợp lệ."}
         if t.flags & (p.ESTOP | p.DRIVER_FAULT):
             return [self.fail("driver_fault"), self.status()]
         if t.flags & 7 != 7:
@@ -335,13 +451,9 @@ class HybridCore:
             self.last_ack_rx = now
         elapsed = (frame.stamp - self.start_stamp) / 1e6
         if self.first_target_seq is not None:
-            valid_ack = t.applied_seq in self.sent_targets
-            if valid_ack and (
-                self.last_ack is None or p.newer(t.applied_seq, self.last_ack)
-            ):
-                self.last_ack, self.last_ack_rx = t.applied_seq, now
-            if now - self.last_ack_rx > self.config["target_ack_timeout_ms"] / 1000:
-                return [self.fail("ack_timeout"), self.status()]
+            detail = self._target_ack_timeout_detail(t.applied_seq, now)
+            if detail is not None:
+                return [self.fail("ack_timeout", detail), self.status()]
         if elapsed >= self.config["warmup_start_s"]:
             if not t.flags & p.TARGET_VALID:
                 return [self.fail("missing_applied_target"), self.status()]
@@ -402,16 +514,16 @@ class HybridCore:
             self.mode = "HOME"
             h = self.config["home_joints"]
             self.target = [h[0], h[1], h[0] + h[2], h[1] + h[3], 0.0, 0.0]
-            return [self.output(frame.seq, p.HOME_PD, 3, self.target)]
+            return [self.output(frame.seq, p.HOME_PD, 3, self.target, sent_at=now)]
         if self.mode == "MODEL":
-            return [self.output(frame.seq, p.POLICY_PD, 3, self.target)]
+            return [self.output(frame.seq, p.POLICY_PD, 3, self.target, sent_at=now)]
         try:
             self.support, phase, flags, self.target, ff = self.logic.step(elapsed, t)
             self.phase = PHASES[phase] if 0 <= phase < len(PHASES) else "Unknown"
         except Exception as error:
             return [self.fail("logic_fault", str(error)), self.status()]
         self.mode = "WARMUP" if elapsed >= self.config["warmup_start_s"] else "STANDUP"
-        return [self.output(frame.seq, p.RECOVERY, flags, self.target, ff)]
+        return [self.output(frame.seq, p.RECOVERY, flags, self.target, ff, sent_at=now)]
 
     def snapshot(self, now=None):
         now = time.monotonic() if now is None else now
@@ -421,7 +533,14 @@ class HybridCore:
             diagnostics["age_s"] = max(0.0, now - self.mcu_diagnostics_rx)
         return {
             "mcu_diagnostics": diagnostics,
+            "ack_diagnostics": {
+                "window_ms": self._target_ack_window_ms(now),
+                "age_ms": None if self.last_ack_rx is None else max(0.0, 1000 * (now - self.last_ack_rx)),
+                "latency_samples": len(self.ack_latency_ms),
+                "latency_ms_recent_max": max(self.ack_latency_ms, default=0.0),
+            },
             "encoder_reset": self.encoder_reset.copy(),
+            "imu_calibration": self.imu_calibration.copy(),
             "epoch": self.epoch,
             "mode": self.mode,
             "phase": self.phase,

@@ -24,6 +24,19 @@ static inline size_t hcr_link_receive(HcrLink *l, const HcrFrame *f, uint64_t no
     }
     return hcr_hello_ack(reply, cap, l->tx_seq++, now, l->epoch);
   }
+  if (l->connected && f->type == HCR_CAL_IMU && f->size == 8 &&
+      hcr_u32(f->payload) == l->epoch &&
+      (!l->have_rx || hcr_newer(f->seq,l->rx_seq))) {
+    uint32_t result=HCR_CAL_IMU_ACCEPTED;
+    if (l->enabled) result=HCR_CAL_IMU_NOT_OFF;
+    else if (l->latched_fault) result=HCR_CAL_IMU_REFUSED;
+    else if (hcr_u32(f->payload+4)!=l->last_telemetry_seq ||
+             now-l->last_telemetry_us>30000) result=HCR_CAL_IMU_FEEDBACK;
+    l->rx_seq=f->seq; l->have_rx=1;
+    uint8_t payload[12]; hcr_put32(payload,l->epoch); hcr_put32(payload+4,f->seq);
+    hcr_put32(payload+8,result);
+    return hcr_encode(reply,cap,HCR_CAL_IMU_ACK,l->tx_seq++,now,payload,sizeof payload);
+  }
   HcrTarget t;
   if (!l->connected || !hcr_target(f, &t) || t.epoch != l->epoch)
     return 0;

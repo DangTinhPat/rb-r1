@@ -63,6 +63,10 @@ rb-r1/
 │   ├── include/rb/recovery/   # Core recovery và hình học chân
 │   ├── include/rb/control/    # LQR, estimator và mô hình hình học được core dùng
 │   └── src/                   # 6 file triển khai cần cho recovery
+├── runtime/                   # Runtime C++ (rb_runtime): lõi trạng thái, HCR1, policy, vòng lặp
+│   ├── include/rb/runtime/    # hybrid_core, protocol, policy, logic, transport, json...
+│   ├── src/                   # Bản C++ của hybrid_core.py, app.py, protocol.py, recovery.py...
+│   └── tests/runtime_tests.cpp  # Test host cho runtime C++
 ├── config/runtime.json        # Cấu hình mặc định trên LF
 ├── models/                    # ONNX, RKNN, normalizer và manifest SHA256
 ├── protocol/include/          # Codec HCR1 C để đối chiếu với MCU
@@ -108,7 +112,8 @@ Trong warm-up, `last_action` lấy từ reference MCU thực sự đã áp dụn
 Bàn giao giữ nguyên GRU. Giữa hai lượt policy, runtime giữ target và vẫn phục
 vụ telemetry ở 200 Hz. Không thêm tanh hoặc clamp action vào `[-1,1]`.
 
-Các giới hạn hiện tại: telemetry/ACK 30 ms; prediction muộn hơn 10 ms bị bỏ;
+Các giới hạn hiện tại: telemetry 30 ms; ACK thích ứng 30–60 ms theo latency
+applied gần đây, có cộng dự phòng settling bánh khi vào Catching; prediction muộn hơn 10 ms bị bỏ;
 trên 15 ms hoặc 3 lần muộn liên tiếp gây FAULT; MCU phải thực thi TTL 20 ms riêng.
 Đây là cơ chế xử lý deadline, không phải cam kết hard real-time của Linux.
 
@@ -166,6 +171,27 @@ Trên LF cần Python thư viện chuẩn, RKNN runtime tại
 ONNX Runtime, GLFW hoặc MuJoCo. Giữ cây thư mục project cùng `build/arm/` và
 `models/` khi triển khai; runtime tự chọn native build ARM trên ARMv7.
 
+### Runtime C++ (`rb_runtime`)
+
+`runtime/` chuyển luồng điều khiển từ Python sang C++ với cùng hành vi: máy trạng thái
+`HybridCore`, codec và parser HCR1, lịch policy 100 Hz, ACK thích ứng, HOME/calib IMU,
+vòng lặp UART/socket, socket lệnh vận hành, file trạng thái. Khác Python ở ba điểm:
+
+- Logic đứng dậy chạy **trong cùng tiến trình** (`native/include/rb/recovery/standup_adapter.hpp`),
+  không còn pipe tới `standup_helper`. Khi lỗi vẫn ghi `/tmp/rb-standup-trace.json`.
+- Chỉ có backend `rknn` (nạp `librknnmrt.so` bằng `dlopen`, kiểm SHA256 theo
+  `models/manifest.json`). Backend `onnx` chỉ còn ở runtime Python.
+- Dashboard web vẫn là Python (`rb_runtime.dashboard`); `rb_runtime` khởi chạy nó như
+  tiến trình con (`RB_PYTHON`, mặc định `python3`). Giao diện, token và lệnh giữ nguyên.
+
+Build và test trên host: `./scripts/build.sh host && ./scripts/test.sh`
+(`build/host/bin/rb_runtime_tests`, mô phỏng MCU bằng socket, policy giả, không đụng NPU).
+Chạy: `build/host/bin/rb_runtime --serial /dev/ttyS2 ...` với các tùy chọn như bản Python.
+
+Bản ARM của `rb_runtime` **không** được build bởi `./scripts/build.sh arm`: nó `dlopen` thư viện
+NPU của board nên phải link động với libc của board (toolchain Luckfox SDK), còn toolchain
+Debian static ở trên không nạp được thư viện đó. Dùng `-DRB_BUILD_RUNTIME=ON` cùng toolchain SDK.
+
 ## 6. Chạy trên LF và vận hành
 
 `config/runtime.json` mặc định dùng `rknn`, `/dev/ttyS2`, 921600 baud, 8N1 và
@@ -201,6 +227,7 @@ python3 scripts/command.py ARM
 python3 scripts/command.py VELOCITY 0.3 0.0
 python3 scripts/command.py DISARM
 python3 scripts/command.py RESET_ENCODERS
+python3 scripts/command.py CAL_IMU
 python3 scripts/command.py ESTOP
 python3 scripts/command.py RESET
 ```

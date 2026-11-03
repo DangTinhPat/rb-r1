@@ -15,6 +15,9 @@ struct SensorFaultContext {
   std::uint64_t at_us=0, imu_stamp_us=0, encoder_stamp_us=0;
   std::uint32_t flags=0;
   bool motor_ready=false, encoders_valid=false, homed=false;
+  std::uint16_t target_flags=0;
+  std::uint32_t target_seq=0;
+  std::array<std::uint64_t,6> channel_stamp_us{};
 };
 struct Diagnostics {
   std::uint32_t epoch = 0, rx_targets = 0, rejected = 0, applied_seq = 0;
@@ -38,7 +41,15 @@ class GatewayCore {
   // original sample timestamp, never for HELLO_ACK packets.
   void telemetrySent(std::uint32_t epoch, std::uint32_t seq,
                      std::uint64_t sample_us) noexcept;
-  void setImu(const ImuObservation& imu) noexcept { imu_ = imu; }
+  void setImu(const ImuObservation& imu) noexcept {
+    imu_ = imu;
+    if (imu.valid) imu_calibration_active_ = false;
+  }
+  bool takeImuCalibrationRequest() noexcept {
+    const bool requested = imu_calibration_requested_;
+    imu_calibration_requested_ = false;
+    return requested;
+  }
   void tick(std::uint64_t now) noexcept;
   void stop(LocalFault reason = LocalFault::None) noexcept;
   void estop() noexcept { stop(LocalFault::Estop); motor_.emergencyStop(); }
@@ -75,6 +86,8 @@ class GatewayCore {
   bool applied_valid_ = false, reset_pending_ = false;
   bool maintenance_ = false;
   bool disable_ack_pending_ = false;
+  bool imu_calibration_requested_ = false, imu_calibration_active_ = false;
+  std::uint64_t imu_calibration_started_us_ = 0;
   LocalFault fault_ = LocalFault::None;
   SensorFaultContext sensor_fault_{};
 };

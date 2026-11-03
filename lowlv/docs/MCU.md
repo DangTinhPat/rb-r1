@@ -53,6 +53,9 @@ Console:
 | `ESTOP` | Latch E-stop cục bộ; LF nhận cờ E-stop trong telemetry |
 | `CLEAR_FAULT` | Xóa lỗi cục bộ chỉ khi motor đã xác nhận OFF; LF cần RESET riêng |
 
+Web LF có thể gửi `CAL_IMU` và chụp HOME qua HCR1; hai lệnh đều chỉ chạy khi
+motor OFF. `CAL_IMU` ACK xác nhận bắt đầu; runtime đợi IMU_VALID để báo hoàn tất.
+
 ARM/DISARM/RESET/VELOCITY là lệnh người vận hành gửi trực tiếp tới LF qua
 `tools/hybrid_command.py`; chúng không phải frame UART. ARM trên LF chỉ bắt đầu
 pha HOME khi telemetry và home hợp lệ. ESP vẫn lặp lại kiểm tra driver, cảm biến,
@@ -187,7 +190,7 @@ Bản sửa cuối đã kiểm UART hai chiều: 2.998 TELEMETRY/15 s (199,86 Hz
 IMU valid, sáu encoder valid, MOTOR_HOME thành công; bus_err=0 cả hai bus.
 LF DISARMED/fault=0; chưa ARM hoặc kiểm chuyển động. Xem
 [report hiện tại](MCU_VALIDATION.md).
-HCR UART có task riêng priority17/core1, tách khỏi console/Wi-Fi/OTA;
+HCR UART có task riêng, tách khỏi console/Wi-Fi/OTA;
 service priority20 và hai motor worker priority18 giữ nguyên.
 Bias IMU và HOME chỉ giữ trong RAM, phải làm lại sau reboot/OTA.
 
@@ -205,3 +208,43 @@ Bias nằm trong RAM, mất sau reboot. Command accepted chưa có nghĩa calibr
 E-stop và lỗi driver cục bộ không bị xóa bởi phiên LF mới; CLEAR_FAULT sau
 verified OFF mới xóa. OTA vào maintenance khóa điều khiển tới reboot và buộc
 đọc lại OFF. Hướng dẫn nạp: [OTA.md](OTA.md).
+
+## Lịch UART sau lỗi ARM 2026-11-03
+
+Bản sửa local đặt thứ tự trên core1: service/watchdog20 > HCR UART19 >
+hai worker motor18, định nghĩa chung tại `core/TaskSchedule.hpp`.
+Trước đây UART17 có thể phải chờ cả hai worker đang ready. Sau khi enqueue
+TX thành công, service gửi task notification để UART thức ngay; timeout
+một RTOS tick vẫn phục vụ RX và phần frame chưa vừa TX FIFO. Mỗi lần pump
+giữ giới hạn4 lượt TX/512 byte RX, không spin chờ FIFO. Notification đến
+trong lúc pump được giữ lại tới lần wait, không mất wakeup.
+
+`UART_DIAG` báo các priority thực tế cùng `stale_tx` và `pump_gap_max_us`.
+`UART_TX_FAULT` giữ context gói control đầu tiên chưa bắt đầu gửi nhưng đã
+chờ quá10 ms: thời điểm, type, sequence, tuổi gói, gap từ lần pump trước và
+số gói còn trong TX queue. Context chỉ xóa khi reboot. Optional execution
+diagnostic vẫn được bỏ qua khi cũ. Gói control cũ vẫn latch Transport;
+không tăng giới hạn10 ms, TTL20 ms hoặc source age30 ms.
+
+Host model kiểm hai worker ready liên tục và đoạn TX motor khóa IRQ200 us:
+UART17 có gói quá10 ms; UART19 không còn starvation trong workload đó,
+watchdog vẫn preempt và cả hai worker vẫn tiến triển. Đây không phải phép đo
+FreeRTOS/ESP và không bảo đảm mọi jitter phần cứng. Cần kiểm `stale_tx`,
+gap và batch deadline trên robot sau OTA; chưa thực hiện trong lần sửa local.
+
+## Chẩn đoán sensor fault theo kênh
+
+`SENSOR_FAULT` giữ thời điểm, tuổi IMU và mẫu encoder cũ nhất trước khi dừng.
+`SENSOR_CHANNELS` giữ `target_seq`, `target_flags` và `age_us_hcr` theo thứ tự
+hipL,hipR,kneeL,kneeR,wheelL,wheelR từ cùng snapshot đó. Tuổi mẫu chưa có
+hoặc timestamp ở tương lai in UINT64_MAX. Feedback phục hồi không ghi đè
+context; CLEAR_FAULT thành công/reboot xóa context. Không thay HCR1/validity.
+
+Ở Kneeling nhả lực, firmware vẫn PING hai khớp trong mỗi batch để đọc encoder;
+joint-enable=0 chỉ tắt lực, không tắt việc theo dõi vị trí. Xem incident và
+regression trong [MOTOR_INTEGRATION.md](MOTOR_INTEGRATION.md).
+
+OTA yêu cầu heartbeat bảo trì mới và verified OFF trước khi bắt đầu. Trong
+callback tiến độ ghi flash, giữ latch bảo trì và OFF đã xác nhận; flash erase
+có thể tạm dừng service task nên không dùng tuổi heartbeat để tự hủy OTA.
+Nếu latch nào mất, cập nhật bị hủy và motor tiếp tục bị khóa trong maintenance.

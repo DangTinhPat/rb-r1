@@ -1,5 +1,6 @@
 #ifdef GATEWAY_FIRMWARE
 #include "gateway/motor/EspBlMotor.hpp"
+#include "gateway/core/TaskSchedule.hpp"
 #include <esp_timer.h>
 #include <algorithm>
 #include <cstring>
@@ -91,9 +92,11 @@ bool EspBlMotor::begin() noexcept {
   const bool right_ok=right_bus.begin(UART_NUM_1,GPIO_NUM_17,GPIO_NUM_18);
   // A healthy bus must still get its OFF worker if the other bus cannot start.
   const bool left_started=left_ok &&
-    xTaskCreatePinnedToCore(workerTask,"motor-left",4096,&left,18,&left_task,1)==pdPASS;
+    xTaskCreatePinnedToCore(workerTask,"motor-left",4096,&left,
+        task_schedule::motor_priority,&left_task,task_schedule::core)==pdPASS;
   const bool right_started=right_ok &&
-    xTaskCreatePinnedToCore(workerTask,"motor-right",4096,&right,18,&right_task,1)==pdPASS;
+    xTaskCreatePinnedToCore(workerTask,"motor-right",4096,&right,
+        task_schedule::motor_priority,&right_task,task_schedule::core)==pdPASS;
   if (!left_started || !right_started) {
     backend.trip(MotorError::Startup); return false;
   }

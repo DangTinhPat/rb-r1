@@ -19,6 +19,7 @@
 #include <cstring>
 #include "gateway/motor/EspBlMotor.hpp"
 #include "gateway/core/GatewayCore.hpp"
+#include "gateway/core/TaskSchedule.hpp"
 #include "gateway/imu/ImuMount.hpp"
 #include "gateway/imu/Mpu6500Spi.hpp"
 #if __has_include("gateway/secrets/HcrWifiSecrets.hpp")
@@ -57,7 +58,7 @@ struct RxEvent {
   HcrFrame frame{};
 };
 struct Command { std::uint32_t op = 0; float vx = 0, wz = 0; std::array<float,4> pose{}; };
-constexpr std::uint32_t kEstop = 100, kCalibrate = 101, kMotorHome = 102, kClearFault = 103, kBusTest = 104;
+constexpr std::uint32_t kEstop = 100, kCalibrate = 101, kMotorHome = 102, kClearFault = 103, kBusTest = 104, kCalibrateHcr = 105;
 struct Report {
   std::uint64_t stamp_us = 0;
   Diagnostics state{};
@@ -85,6 +86,15 @@ unsigned ota_percent = 0;
 bool uart_ready = false;
 std::atomic<std::uint32_t> parser_errors{0}, queue_errors{0}, uart_rx_bytes{0}, uart_tx_bytes{0};
 std::atomic<std::uint32_t> stale_tx{0}, rx_queue_full{0}, tx_queue_full{0}, sent_queue_full{0}, uart_gap_max_us{0};
+struct UartTxFault {
+  std::uint64_t at_us=0, age_us=0;
+  std::uint32_t seq=0, pump_gap_us=0, queued=0;
+  std::uint8_t type=0;
+};
+// First stale control packet since boot. Console reads a coherent snapshot;
+// later traffic and OFF cleanup must not overwrite the cause of this stop.
+UartTxFault uart_tx_fault{};
+portMUX_TYPE uart_tx_fault_lock=portMUX_INITIALIZER_UNLOCKED;
 HcrParser parser{};
 Mpu6500Spi imu_driver;
 EspBlMotor motor_system;
@@ -104,7 +114,10 @@ bool due(std::uint64_t now, std::uint64_t& next, std::uint64_t period) {
 
 bool queuePacket(const WirePacket& p) {
   if (!p.size) return true;
-  if (xQueueSend(tx_queue, &p, 0) == pdTRUE) return true;
+  if (xQueueSend(tx_queue, &p, 0) == pdTRUE) {
+    if (uart_task) xTaskNotifyGive(uart_task);
+    return true;
+  }
   ++tx_queue_full; ++queue_errors; transport_fault.store(true); return false;
 }
 
@@ -148,6 +161,15 @@ void service(void*) {
       else
         queuePacket(core.receive(event.frame, now, event.received_us));
     }
+    if (core.takeImuCalibrationRequest()) {
+      report.command_op = kCalibrateHcr;
+      if (!core.diagnostics(now).armed && motors.disabled()) {
+        attitude.calibrateStationary(); imu = {}; core.setImu(imu);
+        report.command_result = 1;
+      } else {
+        report.command_result = 2;
+      }
+    }
     Command command{};
     for (unsigned n = 0; n < 4 && xQueueReceive(command_queue, &command, 0) == pdTRUE; ++n) {
       report.command_op = command.op; report.command_result = 1;
@@ -179,7 +201,8 @@ void service(void*) {
     if (due(now, next_execution_diag, 100000) && uxQueueSpacesAvailable(tx_queue)>1) {
       // Optional diagnostics may be skipped; leave space for control traffic.
       const auto packet=core.executionDiagnostics(now);
-      if (packet.size) (void)xQueueSend(tx_queue,&packet,0);
+      if (packet.size && xQueueSend(tx_queue,&packet,0)==pdTRUE && uart_task)
+        xTaskNotifyGive(uart_task);
     }
     const auto duration = static_cast<std::uint32_t>(esp_timer_get_time()-now);
     if (duration > report.service_max_us) report.service_max_us = duration;
@@ -250,7 +273,13 @@ void pumpOta() {
       flushConsoles();
     });
     ArduinoOTA.onProgress([](unsigned done, unsigned total) {
-      if (!otaSafe()) { Update.abort(); ota_error = 101; }
+      // Flash erase/write can pause the service task long enough to age the
+      // heartbeat. Maintenance and verified OFF are latched before OTA_BEGIN;
+      // keep checking that latch here without treating flash latency as loss
+      // of the pre-upload maintenance handshake.
+      if (!maintenance_requested.load() || !maintenance_ready.load()) {
+        Update.abort(); ota_error = 101;
+      }
       ota_percent = total ? static_cast<unsigned>(100ULL*done/total) : 0;
     });
     ArduinoOTA.onError([](ota_error_t error) {
@@ -308,6 +337,14 @@ void status() {
         sample_age(f.imu_stamp_us),sample_age(f.encoder_stamp_us),
         f.motor_ready,f.encoders_valid,f.homed);
     printLine(line);
+    std::snprintf(line,sizeof line,
+        "SENSOR_CHANNELS target_seq=%u target_flags=0x%02x "
+        "age_us_hcr=[%llu %llu %llu %llu %llu %llu]\n",
+        f.target_seq,f.target_flags,
+        sample_age(f.channel_stamp_us[0]),sample_age(f.channel_stamp_us[1]),
+        sample_age(f.channel_stamp_us[2]),sample_age(f.channel_stamp_us[3]),
+        sample_age(f.channel_stamp_us[4]),sample_age(f.channel_stamp_us[5]));
+    printLine(line);
   }
   const auto* running = esp_ota_get_running_partition();
   const auto* next = esp_ota_get_next_update_partition(nullptr);
@@ -336,9 +373,21 @@ void status() {
       latest_report.raw_gyro[1],latest_report.raw_gyro[2]);
   printLine(line);
   std::snprintf(line,sizeof line,
-      "UART_DIAG stale_tx=%u rx_queue_full=%u tx_queue_full=%u sent_queue_full=%u pump_gap_max_us=%u\n",
-      stale_tx.load(),rx_queue_full.load(),tx_queue_full.load(),sent_queue_full.load(),uart_gap_max_us.load());
+      "UART_DIAG stale_tx=%u rx_queue_full=%u tx_queue_full=%u sent_queue_full=%u pump_gap_max_us=%u "
+      "service_priority=%u uart_priority=%u motor_priority=%u\n",
+      stale_tx.load(),rx_queue_full.load(),tx_queue_full.load(),sent_queue_full.load(),uart_gap_max_us.load(),
+      task_schedule::service_priority,task_schedule::uart_priority,task_schedule::motor_priority);
   printLine(line);
+  portENTER_CRITICAL(&uart_tx_fault_lock);
+  const auto tx_fault=uart_tx_fault;
+  portEXIT_CRITICAL(&uart_tx_fault_lock);
+  if (tx_fault.at_us) {
+    std::snprintf(line,sizeof line,
+        "UART_TX_FAULT at_us=%llu type=0x%02x seq=%u age_us=%llu pump_gap_us=%u queued=%u\n",
+        static_cast<unsigned long long>(tx_fault.at_us),tx_fault.type,tx_fault.seq,
+        static_cast<unsigned long long>(tx_fault.age_us),tx_fault.pump_gap_us,tx_fault.queued);
+    printLine(line);
+  }
   const auto& motor = latest_report.motor;
   std::snprintf(line,sizeof line,"IMU_CAL manual=%d samples=%u bias_rad_s=[%.5f %.5f %.5f] corrected_gyro=[%.5f %.5f %.5f]\n",
       latest_report.calibration_manual,latest_report.calibration_samples,
@@ -481,7 +530,7 @@ bool startUart() {
       uart_set_pin(kLfUart, HCR_UART_TX, HCR_UART_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE) != ESP_OK)
     return false;
   // No TX ring: uart_tx_chars() only accepts bytes fitting the hardware FIFO.
-  // Its nonblocking partial writes are completed by loop().
+  // Its nonblocking partial writes are completed by the dedicated UART task.
   return uart_driver_install(kLfUart, 4096, 0, 0, nullptr, 0) == ESP_OK;
 }
 
@@ -489,9 +538,10 @@ void pumpUart() {
   if (!uart_ready) return;
   static std::uint64_t last_pump=0;
   const auto pump_now=static_cast<std::uint64_t>(esp_timer_get_time());
+  std::uint32_t pump_gap=0;
   if (last_pump) {
-    const auto gap=static_cast<std::uint32_t>(pump_now-last_pump);
-    if (gap>uart_gap_max_us.load()) uart_gap_max_us.store(gap);
+    pump_gap=static_cast<std::uint32_t>(std::min<std::uint64_t>(pump_now-last_pump,UINT32_MAX));
+    if (pump_gap>uart_gap_max_us.load()) uart_gap_max_us.store(pump_gap);
   }
   last_pump=pump_now;
   static WirePacket pending{};
@@ -502,6 +552,14 @@ void pumpUart() {
     const auto now = static_cast<std::uint64_t>(esp_timer_get_time());
     if (now-hcr_u64(pending.bytes.data()+12) > 10000 && offset == 0) {
       const bool optional=pending.bytes[3]==HCR_EXECUTION_DIAG;
+      if (!optional) {
+        const UartTxFault fault{now,now-hcr_u64(pending.bytes.data()+12),
+            hcr_u32(pending.bytes.data()+8),pump_gap,
+            static_cast<std::uint32_t>(uxQueueMessagesWaiting(tx_queue)),pending.bytes[3]};
+        portENTER_CRITICAL(&uart_tx_fault_lock);
+        if (!uart_tx_fault.at_us) uart_tx_fault=fault;
+        portEXIT_CRITICAL(&uart_tx_fault_lock);
+      }
       pending = {};
       if (!optional) { transport_fault.store(true); ++queue_errors; ++stale_tx; }
       continue;
@@ -535,7 +593,11 @@ void pumpUart() {
 void uartTask(void*) {
   // Exclusive UART0/parser owner. Console, Wi-Fi and OTA may block loop();
   // they must not stall the HCR wire path or age queued sensor packets.
-  for (;;) { pumpUart(); vTaskDelay(1); }
+  // Service wakes TX immediately after enqueue. Retain a one-tick timeout to
+  // poll RX and finish FIFO-limited writes even when no new packet is queued.
+  // Notifications retained during pumpUart prevent a lost enqueue/wait wakeup.
+  // Each pump is bounded (4 TX attempts, 512 RX bytes); never busy-wait on FIFO.
+  for (;;) { pumpUart(); ulTaskNotifyTake(pdTRUE,1); }
 }
 }  // namespace
 
@@ -553,13 +615,15 @@ void setup() {
   motor_system.begin();
   uart_ready = startUart();
   if (!uart_ready) transport_fault.store(true);
-  if (uart_ready && xTaskCreatePinnedToCore(uartTask,"hcr-uart",4096,nullptr,17,&uart_task,1)!=pdPASS) {
+  if (uart_ready && xTaskCreatePinnedToCore(uartTask,"hcr-uart",4096,nullptr,
+      task_schedule::uart_priority,&uart_task,task_schedule::core)!=pdPASS) {
     uart_ready=false; transport_fault.store(true);
   }
   esp_timer_create_args_t timer_args{};
   timer_args.callback = timerCallback; timer_args.name = "hcr-service";
   if (esp_timer_create(&timer_args, &service_timer) != ESP_OK ||
-      xTaskCreatePinnedToCore(service, "hcr-service", 8192, nullptr, 20, &service_task, 1) != pdPASS) {
+      xTaskCreatePinnedToCore(service, "hcr-service", 8192, nullptr,
+          task_schedule::service_priority, &service_task, task_schedule::core) != pdPASS) {
     service_task = nullptr; printLine("FATAL service task/timer\n"); return;
   }
   WiFi.persistent(false); WiFi.mode(WIFI_STA); WiFi.setSleep(false);

@@ -37,11 +37,13 @@
         <button class="btn arm" data-command="ARM" disabled>ARM · Bắt đầu</button>
         <button class="btn stop" data-command="DISARM">Disable · Tắt motor</button>
         <button class="btn reset" data-command="RESET" disabled>RESET phiên / lỗi</button>
-        <button class="btn reset" data-command="RESET_ENCODERS" disabled>Reset encoder · Chụp HOME</button>
+        <button class="btn reset" data-command="RESET_ENCODERS" disabled>Set homing · Chụp HOME</button>
+        <button class="btn reset" data-command="CAL_IMU" disabled>Calib IMU · giữ yên</button>
         <button class="btn estop" data-command="ESTOP">E-STOP · Dừng khẩn cấp</button>
       </div>
-      <p class="note">Disable → đợi motor OFF → xếp hai chân về HOME bằng tay → Reset encoder. Chỉ chụp mốc góc, không làm chân chuyển động hay tự ARM. IMU được giữ nguyên.</p>
+      <p class="note">Xếp hai chân đúng HOME bằng tay trước khi bấm Set homing; nút chỉ chụp mốc, không làm chân chuyển động. Calib IMU cần motor OFF và giữ robot hoàn toàn yên; ESP lấy ít nhất 500 mẫu rồi báo kết quả. Cả hai lệnh không tự ARM.</p>
       <p id="encoder-reset" class="note" role="status"></p>
+      <p id="imu-calibration" class="note" role="status"></p>
       <p id="command-result" class="note" role="status"></p>
       <p class="note">ARM chỉ là yêu cầu. LF và ESP32 vẫn kiểm tra liên kết, cảm biến, tư thế home và trạng thái driver. E-STOP qua mạng không thay thế nút dừng cứng.</p>
       <div class="keybox"><input id="token" type="password" autocomplete="off" placeholder="Access token từ LF"><button id="save">Lưu</button></div>
@@ -68,7 +70,7 @@
       <div class="kv"><span>Cập nhật trạng thái</span><b id="age">—</b></div>
     </section>
   </div>
-  <footer>Trang tự đọc lại trạng thái sau mất kết nối. Dữ liệu cũ khóa ARM/RESET/Reset encoder; DISARM và E-STOP vẫn có thể gửi yêu cầu. Kết nối lại không tự gửi lệnh.</footer>
+  <footer>Trang tự đọc lại trạng thái sau mất kết nối. Dữ liệu cũ khóa ARM/RESET/Set homing/Calib IMU; DISARM và E-STOP vẫn có thể gửi yêu cầu. Kết nối lại không tự gửi lệnh.</footer>
 </main><div id="toast" class="toast"></div>
 <script>
 const $ = id => document.getElementById(id);
@@ -90,6 +92,7 @@ function armBlockers() {
   if (!isFresh()) return ['Chờ dữ liệu trạng thái mới'];
   if (!s?.runtime_online) return ['Runtime offline'];
   if (s.encoder_reset?.state === 'pending') return ['Đang chờ ESP chụp HOME'];
+  if (['pending','running'].includes(s.imu_calibration?.state)) return ['Đang chờ calib IMU hoàn tất'];
   if (s.mode === 'FAULT') return [`ARM bị khóa vì lỗi ${s.fault_code}: ${s.reason || ''}`];
   if (s.mode !== 'DISARMED') return ['ARM chỉ dùng khi DISARMED'];
   const flags = s.last_telemetry_flags ?? 0;
@@ -108,7 +111,14 @@ function allowed(command) {
   if (command === 'RESET_ENCODERS') {
     const s = lastStatus, flags = s.last_telemetry_flags ?? 0;
     return s.link && (s.mode === 'DISARMED' || (s.mode === 'FAULT' && s.fault_code === 2))
-      && (flags & 2) && !(flags & 72) && s.encoder_reset?.state !== 'pending';
+      && (flags & 2) && !(flags & 72) && s.encoder_reset?.state !== 'pending'
+      && !['pending','running'].includes(s.imu_calibration?.state);
+  }
+  if (command === 'CAL_IMU') {
+    const s = lastStatus, flags = s.last_telemetry_flags ?? 0;
+    return s.link && (s.mode === 'DISARMED' || (s.mode === 'FAULT' && s.fault_code === 2))
+      && (flags & 2) && !(flags & 72) && s.encoder_reset?.state !== 'pending'
+      && !['pending','running'].includes(s.imu_calibration?.state);
   }
   return command !== 'ARM' || armBlockers().length === 0;
 }
@@ -183,6 +193,8 @@ function render(status) {
   $('reason').textContent = status.reason || '';
   renderMotorDiagnostics(status);
   $('encoder-reset').textContent = status.encoder_reset?.message || 'Chưa chụp HOME trong phiên này';
+  $('imu-calibration').textContent = status.imu_calibration?.message ||
+    ((status.last_telemetry_flags ?? 0) & 1 ? 'IMU hiện hợp lệ.' : 'IMU chưa hợp lệ; cần calib khi robot đứng yên.');
   $('runtime').textContent = live ? 'Online' : 'Offline';
   $('epoch').textContent = status.epoch ?? '—';
   $('steps').textContent = status.policy_steps ?? '—';
@@ -231,7 +243,9 @@ async function command(operation) {
       headers:{'Content-Type':'application/json'}, body:JSON.stringify({command:operation})});
     if (typeof result.accepted !== 'boolean') throw Error('Thiếu xác nhận lệnh');
     if (serial === commandSerial) {
-      const message = result.accepted ? (operation === 'RESET_ENCODERS' ? 'Đã gửi yêu cầu chụp HOME; chờ ESP xác nhận bên trái.' : `${operation}: runtime đã nhận (${names[result.mode] || result.mode})`)
+      const message = result.accepted ? (operation === 'RESET_ENCODERS' ? 'Đã gửi yêu cầu chụp HOME; chờ ESP xác nhận.'
+        : operation === 'CAL_IMU' ? 'Đã gửi yêu cầu calib IMU; giữ robot yên tới khi ESP báo hoàn tất.'
+        : `${operation}: runtime đã nhận (${names[result.mode] || result.mode})`)
         : result.error || result.fault || `${operation} bị từ chối`;
       $('command-result').textContent = message; toast(message);
     }

@@ -56,6 +56,7 @@ def main():
     kinds = {}
     next_hello = next_report = 0
     last_telemetry = None
+    last_telemetry_seq = None
     start = time.monotonic()
 
     def send(kind, payload):
@@ -102,10 +103,17 @@ def main():
                     hello_acks += 1
                     linked = True
                     send(p.STATUS,p.STATUS_DATA.pack(epoch,1,0,0))
+                elif linked and f.kind == p.CAL_IMU and len(f.payload)==8:
+                    _,source_seq=p.CAL_IMU_DATA.unpack(f.payload)
+                    result=(p.CAL_IMU_ACCEPTED if source_seq==last_telemetry_seq and
+                            last_telemetry is not None and now-last_telemetry<=.03
+                            else p.CAL_IMU_FEEDBACK)
+                    send(p.CAL_IMU_ACK,p.CAL_IMU_ACK_DATA.pack(epoch,f.seq,result))
                 elif linked and f.kind == p.TELEMETRY:
                     t = p.Telemetry.decode(f.payload)
                     frames += 1
                     last_telemetry = now
+                    last_telemetry_seq = f.seq
                     send(p.TARGET,p.TARGET_DATA.pack(epoch,f.seq,p.DISABLED,0,*([0.]*10)))
                     if now >= next_report:
                         print(json.dumps({'link': True,'frames': frames,'flags': t.flags,

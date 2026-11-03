@@ -18,6 +18,7 @@ struct TestMotors final : MotorBackend {
   bool ready() const noexcept override { return available; }
   MotorFeedback feedback(std::uint64_t now) noexcept override {
     MotorFeedback f{}; f.stamp_us = now-encoder_age_us;
+    for(unsigned i=0;i<6;++i) f.encoder_stamp_us[i]=now-(i==2?encoder_age_us:0);
     f.q = {2.35706715F,2.35706715F,0,0,0,0};
     f.encoders_valid = f.homed = available;
     if (bad_feedback) f.q[0] = std::numeric_limits<float>::quiet_NaN();
@@ -90,6 +91,10 @@ void tests() {
       assert(fault.fault==LocalFault::Sensors && !fault.armed && !fault.enabled);
       const auto frozen=fault.sensor_fault;
       assert(frozen.motor_ready);
+      assert(frozen.target_flags==m.last_target.flags);
+      assert(frozen.target_seq==target(source).seq);
+      assert(frozen.channel_stamp_us[0]==frozen.at_us);
+      assert(frozen.channel_stamp_us[2]==frozen.at_us-m.encoder_age_us);
       if(stale_imu) {
         assert(!(frozen.flags&HCR_IMU_OK) && (frozen.flags&HCR_ENCODER_OK));
         assert(frozen.at_us-frozen.imu_stamp_us==10001);
@@ -102,6 +107,8 @@ void tests() {
       assert((recovered.telemetry_flags&7)==7);
       assert(recovered.sensor_fault.at_us==frozen.at_us);
       assert(recovered.sensor_fault.flags==frozen.flags);
+      assert(recovered.sensor_fault.channel_stamp_us==frozen.channel_stamp_us);
+      assert(recovered.sensor_fault.target_flags==frozen.target_flags);
       assert(recovered.fault==LocalFault::Sensors); // fresh data cannot clear latch
       assert(c.clearLocalFault());assert(!c.diagnostics(115000).sensor_fault.at_us);
     }

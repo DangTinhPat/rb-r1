@@ -112,7 +112,7 @@ class DashboardServer:
                     if not isinstance(request, dict):
                         raise ValueError("command request must be an object")
                     command = request.get("command")
-                    if command not in ("ARM", "DISARM", "RESET", "ESTOP", "RESET_ENCODERS"):
+                    if command not in ("ARM", "DISARM", "RESET", "ESTOP", "RESET_ENCODERS", "CAL_IMU"):
                         raise ValueError("unsupported command")
                 except (UnicodeError, ValueError, TypeError) as error:
                     self._json(400, {"accepted": False, "error": str(error)})

@@ -16,6 +16,8 @@ struct MotorFeedback {
   std::array<float, 2> hip_torque{};
   bool encoders_valid = false, homed = false, torque_valid = false;
   bool driver_fault = false, estop = false;
+  // Console diagnostics only, in HCR joint order. Zero means unavailable.
+  std::array<std::uint64_t,6> encoder_stamp_us{};
 };
 
 inline std::array<float, 6> coreToHcr(const std::array<float, 6>& core) {

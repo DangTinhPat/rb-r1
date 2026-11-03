@@ -111,6 +111,8 @@ MotorFeedback BlMotorBackend::feedback(std::uint64_t now) noexcept {
   f.stamp_us=state_[0].stamp[0];
   for (const auto& leg:state_) for (auto stamp:leg.stamp)
     f.stamp_us=std::min(f.stamp_us,stamp);
+  for (unsigned s=0;s<2;++s) for (unsigned j=0;j<3;++j)
+    f.encoder_stamp_us[2*j+s]=state_[s].stamp[j];
   f.encoders_valid=sensorsFresh(now); f.homed=homed_ && f.encoders_valid;
   if (!f.encoders_valid) return f;
   for (unsigned s=0;s<2;++s) {
@@ -330,6 +332,7 @@ ApplyResult BlMotorBackend::apply(const HcrTarget& t, std::uint32_t seq,
 }
 
 void BlMotorWorker::fail(MotorError e) noexcept {
+  legs_engaged_=false;
   if (state_.error==MotorError::None) {
     state_.error=e;
     auto& f=state_.fault_context;
@@ -570,6 +573,7 @@ bool BlMotorWorker::wheelRead() noexcept {
   return true;
 }
 bool BlMotorWorker::off() noexcept {
+  legs_engaged_=false;
   guard_active_=false; bus_.setPermit({}); wheel_goal_valid_=false;
   state_.prepared=false; state_.wheel_ready=false; wheel_enabled_at_=0; wheel_zero_verified_=false;
   bool ok=true;
@@ -642,9 +646,10 @@ void BlMotorWorker::step() noexcept {
     state_.active_cycle_us=state_.active_cycle_max_us=state_.active_io_us=state_.active_io_max_us=0;
   }
   was_active_=r.active;
+  if (!r.active) legs_engaged_=false;
   if (!validMotorConfig(owner_.config())) { fail(MotorError::Configuration); return; }
   if (r.reset_generation!=state_.reset_generation) {
-    state_={}; state_.reset_generation=r.reset_generation;
+    state_={}; state_.reset_generation=r.reset_generation; legs_engaged_=false;
     on_={true,true,true}; wheel_goal_valid_=false; wheel_sample_=false; wheel_enabled_at_=0; wheel_zero_verified_=false;
   }
   if (!r.active && state_.generation!=r.generation) { on_={true,true,true}; state_.off=false; }
@@ -693,7 +698,18 @@ void BlMotorWorker::step() noexcept {
       const auto claim=owner_.claimBatch(side_,r.batch,bus_.now());
       if (claim==BatchClaim::Expired) { batch_io_=true; fail(MotorError::Expired); }
       batch_io_=claim==BatchClaim::Claimed;
+      const bool claimed=batch_io_;
       bool ok=batch_io_ && allowed(r,true);
+      // The wheel command is the latency-critical write: its response is the
+      // slowest in the loop. Once an earlier MIT batch on this bus has completed,
+      // the legs are already held, so send the wheel first instead of after the
+      // two joint blocks. The first batch of a session, and any batch with the
+      // legs released, keep the legs-before-wheel order.
+      const bool wheel_first=ok && legs_engaged_ && (r.batch.flags&1U) && (r.batch.flags&2U) && settled;
+      if (wheel_first) {
+        ok=wheelSpeed(r.batch.wheel_rpm);
+        if (ok && r.batch.wheel_rpm!=0) wheel_zero_verified_=false;
+      }
       for (unsigned j=0;j<2 && ok;++j) {
         if (!allowed(r,true)) { ok=false; break; }
         if (r.batch.flags&1U) {
@@ -701,17 +717,29 @@ void BlMotorWorker::step() noexcept {
           // A full MIT block auto-enables the joint. Mark unknown/on BEFORE
           // writing, so timeout/CRC failure still causes an OFF attempt.
           on_[j]=true; state_.torque_enable[j]=255; ok=transact(j,3,p,11);
-        } else if (on_[j]) ok=torque(j,false);
+        } else {
+          if (on_[j]) ok=torque(j,false);
+          // Released joints still need real encoder feedback. Continuous
+          // batches can leave no background-poll slot (notably Kneeling).
+          // PING reads position without enabling torque or writing a target.
+          if (ok && allowed(r,true)) ok=transact(j,1,nullptr,0);
+          else ok=false;
+        }
       }
       if (ok && allowed(r,true)) {
         if (r.batch.flags&2U) {
-          if (settled) ok=wheelSpeed(r.batch.wheel_rpm);
-          else ok=wheel_zero_verified_ && r.batch.wheel_rpm==0;
-          if (ok && r.batch.wheel_rpm!=0) wheel_zero_verified_=false;
+          if (!wheel_first) {
+            if (settled) ok=wheelSpeed(r.batch.wheel_rpm);
+            else ok=wheel_zero_verified_ && r.batch.wheel_rpm==0;
+            if (ok && r.batch.wheel_rpm!=0) wheel_zero_verified_=false;
+          }
         } else if (on_[2]) ok=torque(2,false);
       } else ok=false;
       if (ok && allowed(r,true)) ok=wheelRead();
-      if (ok && allowed(r,true)) state_.completed=r.batch.token;
+      if (ok && allowed(r,true)) {
+        state_.completed=r.batch.token;
+        legs_engaged_=(r.batch.flags&1U)!=0;
+      } else if (claimed) legs_engaged_=false; // a superseded batch changes nothing on the bus
       batch_io_=false;
     } else if (allowed(r,false)) {
       // MIT replies and the batch wheel read already refresh feedback. Do not

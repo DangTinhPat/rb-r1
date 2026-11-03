@@ -39,6 +39,10 @@ Little endian, không padding. Float là IEEE754 binary32. CRC32 IEEE như
 LF kiểm tra timestamp, CRC và sequence; gói trùng/cũ không làm mới watchdog.
 Clock của LF và ESP32 không cần đồng bộ. ESP32 dùng `esp_timer_get_time()` (64 bit).
 
+Các type lệnh vận hành bổ sung: `0x83 ENCODER_HOME` / `0x05 ENCODER_HOME_ACK`;
+`0x84 CAL_IMU` / `0x07 CAL_IMU_ACK`. Cả hai request mang epoch cùng sequence
+TELEMETRY nguồn; reply mang epoch, sequence request và mã kết quả.
+
 ## 2. Bắt tay và vận hành
 
 1. LF gửi `HELLO (1)` mỗi giây khi chờ liên kết. Payload `<IHHI>`:
@@ -48,8 +52,9 @@ Clock của LF và ESP32 không cần đồng bộ. ESP32 dùng `esp_timer_get_t
    hiệu chuẩn và q ở tư thế home trước ARM. Thời gian HOME bắt đầu ở sample đầu sau ARM.
 4. Người vận hành gửi lệnh cục bộ vào runtime trên LF qua Unix socket
    `/tmp/rb-hybrid-command.sock` (mode `0600`): `ARM`, `DISARM`, `RESET`,
-   `ESTOP`, `RESET_ENCODERS` hoặc `VELOCITY vx wz`. Các lệnh này không phải frame HCR1 và ESP32
-   không chuyển tiếp lệnh người vận hành. Không tự ARM khi boot/reconnect.
+   `ESTOP`, `RESET_ENCODERS`, `CAL_IMU` hoặc `VELOCITY vx wz`. Socket này không
+   phải HCR1; runtime đổi riêng RESET_ENCODERS và CAL_IMU thành request HCR1
+   chuyên biệt. Không tự ARM khi boot/reconnect.
 5. LF gửi TARGET ở 200 Hz: logic được cập nhật 200 Hz; action policy đổi 100 Hz,
    giữ nguyên giữa hai packet. Servo fixture trong HIL tích phân 2000 Hz;
    task service MCU được yêu cầu đánh thức 2000 Hz. Hai con số này không chứng minh
@@ -241,6 +246,16 @@ Sau reply thành công, LF gửi disabled, tạo epoch mới rồi bắt tay v�
 không tự ARM. LF chỉ nhận reply khớp epoch/request đang chờ. Sau 1 s chưa có
 reply, UI báo chưa xác nhận; không tự gửi lại khi timeout hoặc reconnect.
 Firmware cũ không hỗ trợ request sẽ hết thời gian chờ; phải cập nhật cả hai tầng.
+
+### Calib IMU khi Disable: CAL_IMU (0x84), CAL_IMU_ACK (0x07)
+
+LF gửi payload `<II>` gồm epoch và source telemetry mới (≤30 ms). ESP chỉ nhận
+khi không armed/enabled, motor backend xác nhận OFF, telemetry nguồn còn mới và
+không có lỗi driver/E-stop. Reply `<III>` gồm epoch, request sequence và kết quả:
+`1` đã nhận, `2` motor chưa OFF, `3` source cũ, `4` trạng thái từ chối, `5` đang
+bận. ACK xác nhận bắt đầu thu mẫu; ESP yêu cầu ít nhất 500 mẫu và 1 s ổn định.
+LF báo hoàn tất khi IMU_VALID xuất hiện, hoặc lỗi sau 5 s. Lệnh không di chuyển
+motor, không xóa lỗi driver/E-stop và không ARM.
 
 ## 6. Mã tích hợp ESP32
 

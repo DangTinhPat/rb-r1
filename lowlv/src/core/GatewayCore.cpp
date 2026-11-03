@@ -27,6 +27,8 @@ void GatewayCore::newSession(std::uint32_t epoch) noexcept {
   rx_stamp_ = deadline_ = last_target_rx_us_ = 0;
   rx_queue_max_us_ = 0;
   connected_ = true; have_rx_ = reset_pending_ = false;
+  imu_calibration_requested_ = imu_calibration_active_ = false;
+  imu_calibration_started_us_ = 0;
   // Reconnection may clear transport/session faults, never a local E-stop or
   // driver fault. Those require an explicit CLEAR_FAULT after verified OFF.
   if (fault_ != LocalFault::Estop && fault_ != LocalFault::Driver)
@@ -60,6 +62,8 @@ bool GatewayCore::freshSensors(std::uint64_t now) const noexcept {
 }
 
 void GatewayCore::tick(std::uint64_t now) noexcept {
+  if (imu_calibration_active_ && now >= imu_calibration_started_us_ &&
+      now-imu_calibration_started_us_ > 5000000) imu_calibration_active_ = false;
   // Deadline checked before any driver or UART work. UART timestamps never
   // postpone this deadline when the service task has stalled.
   if (enabled_ && now >= deadline_) stop(LocalFault::TargetTimeout);
@@ -74,7 +78,8 @@ void GatewayCore::tick(std::uint64_t now) noexcept {
     const bool ready=motor_.ready();
     if (!ready || !freshSensors(now)) {
       sensor_fault_={now,imu_.stamp_us,feedback_.stamp_us,flags(now),ready,
-                     feedback_.encoders_valid,feedback_.homed};
+                     feedback_.encoders_valid,feedback_.homed,target_.flags,
+                     target_seq_,feedback_.encoder_stamp_us};
       stop(LocalFault::Sensors);
     }
   }
@@ -171,6 +176,26 @@ WirePacket GatewayCore::receive(const HcrFrame& f, std::uint64_t now,
     reply.size=hcr_encode(reply.bytes.data(),reply.bytes.size(),HCR_ENCODER_HOME_ACK,
                           tx_seq_++,now,payload,sizeof payload);
     return reply; // never refresh TARGET deadline, clear faults or ARM
+  }
+  if (f.type == HCR_CAL_IMU && f.size == 8) {
+    std::uint32_t result=HCR_CAL_IMU_REFUSED;
+    const bool allowed_remote_fault=remote_mode_==6 && remote_fault_==2;
+    if (armed_ || enabled_ || !motor_.disabled()) result=HCR_CAL_IMU_NOT_OFF;
+    else if ((fault_!=LocalFault::None && fault_!=LocalFault::RemoteFault) ||
+             (remote_mode_>1 && !allowed_remote_fault)) result=HCR_CAL_IMU_REFUSED;
+    else if (!sourceValid(hcr_u32(f.payload+4),now)) result=HCR_CAL_IMU_FEEDBACK;
+    else if (imu_calibration_active_) result=HCR_CAL_IMU_BUSY;
+    else {
+      imu_calibration_requested_=imu_calibration_active_=true;
+      imu_calibration_started_us_=now;
+      result=HCR_CAL_IMU_ACCEPTED;
+    }
+    rx_seq_=f.seq; rx_stamp_=f.stamp_us; have_rx_=true; last_rx_us_=now;
+    std::uint8_t payload[12]{};
+    hcr_put32(payload,epoch_); hcr_put32(payload+4,f.seq); hcr_put32(payload+8,result);
+    reply.size=hcr_encode(reply.bytes.data(),reply.bytes.size(),HCR_CAL_IMU_ACK,
+                          tx_seq_++,now,payload,sizeof payload);
+    return reply; // calibration never enables motors or renews TARGET
   }
   HcrTarget target{};
   if (!hcr_target(&f, &target) ||

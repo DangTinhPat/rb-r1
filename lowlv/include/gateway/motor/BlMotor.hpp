@@ -250,6 +250,7 @@ class BlMotorWorker {
   std::uint8_t request_id_=0, request_instruction_=0, request_address_=0;
   bool guard_active_=false;
   bool batch_io_=false, was_active_=false;
+  bool legs_engaged_=false; // a completed MIT batch holds the legs on this bus
   BusError request_error_=BusError::None;
   std::int16_t wheel_goal_rpm_=0;
   std::uint64_t wheel_goal_at_=0;

@@ -364,3 +364,81 @@ sensor fault mới hoặc xóa bởi CLEAR_FAULT thành công/reboot. Không đ�
 Host regressions bao phủ interleaving, ACK hai bus, sample khác thật sự stale,
 reply CRC lỗi/hủy, reset generation cũ và context IMU/encoder fault. Đây là
 bản sửa đã kiểm trên host/build MCU; chưa OTA và chưa xác nhận bằng stand thật.
+
+## UART bị chậm phục vụ sau ARM — 2026-11-03
+
+Evidence `.local/incident-runs/20261103-085646/`, firmware ELF
+`1208ec8b6688577a7e0b054b561f1440ab88a7ffcc66223e1722fc108767102c`:
+ARM vào HOME, sau0.506839 s LF nhận DRIVER_FAULT và dừng, chưa vào STANDUP.
+MCU `local_fault=5` (Transport), `motor_error=0`, worker L/R không fault;
+IMU/HOME vẫn valid, cả sáu Torque Enable sau dừng đọc lại bằng0.
+So với snapshot ngay sau calibration, `stale_tx` và `queue_err` tăng0→1,
+`pump_gap_max_us` tăng9954→11627; các queue overflow và MCU CRC vẫn0.
+LF parser=7 ở cả HOME và FAULT, web process vẫn alive. Applied latency max8931 us.
+Nhánh gây latch xác định được: `pumpUart` bỏ gói control chưa gửi có tuổi>10 ms
+và yêu cầu service dừng vì Transport. Firmware cũ chưa đóng băng type/seq/age
+ngay lúc đó, nên không khẳng định gap cực đại chính là gap của gói gây lỗi.
+
+Review phát hiện UART17 thấp hơn hai motor worker18 trên cùng core1.
+Host regression với service2 kHz, hai worker ready và critical section200 us
+tái hiện starvation: UART17 có max queue age13350 us, test FAIL trước sửa.
+Bản sửa đặt UART19 dưới watchdog20, thêm notification sau enqueue để thức
+ngay; vẫn polling RX/phần TX chưa gửi sau tối đa một tick khi task được lập
+lịch. Cùng host model đạt queue age940 us, không stale; watchdog vẫn có ưu
+tiên cao nhất, cả hai worker tiến triển. Các số này là kết quả model có tải
+CPU quy định, không phải phép đo thực tế và không chứng minh jitter đã hết.
+
+Không đổi frame HCR, source timestamp, sent-history, ACK cả hai bus, FIFO
+partial writes, stale control gate10 ms, TTL20 ms, source age30 ms hay fault
+latch. Console thêm `UART_TX_FAULT` giữ context stale TX đầu tiên từ boot,
+và priority trong `UART_DIAG`, để đánh giá lần chạy thật tiếp theo.
+
+## Encoder khớp bị bỏ đọc khi nhả lực Kneeling — 2026-11-03
+
+Incident `.local/incident-runs/20261103-091058/`, ELF
+`7c82f5be1441a1c8cd451bceb0b5f6fad1314f0d8b52d0572b5fab6725615bb7`:
+FAULT sau ARM4.672087s / STANDUP1.666055s, pha Kneeling. Context thật:
+`local_fault=Sensors`, encoder age20046us, IMU age505us, motor_error0.
+MCU CRC/queue/stale-TX đều0; LF parser giữ8 suốt HOME/STANDUP/FAULT,
+web vẫn alive. Hai bus đã đọc lại cả sáu Torque Enable bằng0 sau dừng.
+Firmware cũ chỉ giữ tuổi mẫu cũ nhất, chưa giữ flags TARGET và kênh cụ thể
+tại fault; không khẳng định đã đo chính xác khớp nào bị stale.
+
+Producer Lumi chủ động nhả cả chân và bánh trong đoạn Kneeling. Host helper
+với feedback tổng hợp chuyển flags3→0 ở1.640s và 0→3 ở2.520s; đây là kiểm
+logic, không phải mô phỏng động lực học hay trace TARGET vật lý. Worker MCU
+trước sửa chỉ gửi OFF một lần khi bit joint-enable tắt; các batch kế tiếp
+không giao dịch khớp, chỉ đọc bánh. Poll nền lại nhường TARGET. Khi mỗi step
+đều có batch, encoder khớp không được cập nhật dù bus không lỗi. Regression
+chạy chính backend với TARGET200Hz tái hiện sau4chu kỳ: hip21750us,
+knee21700us, wheel4800us; encoder validity FAIL trước sửa.
+
+Mỗi batch có joint-enable=0 nay xác nhận OFF nếu cần, rồi PING cả hai khớp
+để nhận encoder thật; không gửi MIT/target hoặc bật lực. Reply phải qua
+status/permit/encoder validation trước publish. Batch chỉ hoàn tất sau cả
+hai khớp và wheel read; ACK vẫn cần cả hai bus. Giữ nguyên TTL20ms,
+freshness20ms/10ms, source age30ms, fault latch, quỹ đạo và gain Lumi.
+Thêm hai PING/bus/batch trong đoạn nhả lực; độ trễ bus thật cần kiểm lại sau OTA.
+
+Host PASS: hai kiểu flags0/2 kéo dài1s, encoder vẫn theo vị trí thay đổi khi
+OFF, không có MIT, ACK không sớm khi mới một bus xong, bật lại vẫn có HOME;
+GatewayCore stream >5s gồm1s nhả lực và bật lại; mất reply, reply hỏng,
+driver status, cancellation và deadline vẫn chặn hoàn tất/làm mới sample.
+ASan/UBSan, gateway/motor/inherited-bus suites,58codec checks,14Python tests,
+3Lumi trajectory tests và build ESP32-S3 đều PASS. Build có warning công cụ
+size `--ng` đã tồn tại; size check và tạo image thực vẫn thành công.
+
+`SENSOR_CHANNELS` đóng băng flags/sequence TARGET và tuổi sáu mẫu theo thứ tự
+hipL,hipR,kneeL,kneeR,wheelL,wheelR, cùng snapshot gây `SENSOR_FAULT` trước OFF.
+Mẫu chưa có/ở tương lai in UINT64_MAX; chẩn đoán không cấp validity/ACK.
+Không thay HCR1 wire format. Bản sửa này chưa OTA hoặc thử stand vật lý;
+host PASS chưa phải xác nhận robot hoàn tất stand.
+
+OTA lần đầu dừng ở83%: ESP giữ app cũ trong maintenance, sáu motor vẫn OFF.
+`OTA.onProgress` đã gọi cùng cổng freshness250ms dùng trước khi bắt đầu; lúc
+flash pause làm task service trễ, callback tự `Update.abort()` (error101,
+update_error12). Giữ kiểm tra freshness trước OTA và tại `onStart`; trong lúc
+ghi flash, callback tiếp tục yêu cầu hai latch `maintenance_requested` và
+`maintenance_ready`, vốn chỉ được đặt sau khi xác nhận OFF. Build chứa cả
+sửa encoder lẫn gate này đã nạp thành công và hash ELF chạy được đối chiếu.
+Đây là kiểm chứng OTA thật; chuyển động/stand sau nạp chưa chạy.
