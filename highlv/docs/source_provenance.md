@@ -71,8 +71,6 @@ SHA256 fitted22500_normalizer.json
 6162a8ba67cf2fb765a35777cfc3b1b0df246491738cfd4e69f55382011462ec
 ```
 
-Model trước đó (Beni512 checkpoint 19500, ONNX FP32 `bfb8097f…`, RKNN `4e5b1dd4…`) đã bị gỡ khỏi
-project; lịch sử có trong git. Không kèm checkpoint training, critic hoặc optimizer.
 
 ## Bản trước khi clean
 

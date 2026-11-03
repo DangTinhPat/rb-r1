@@ -1,6 +1,5 @@
 {
   "model": "fitted22500_dfp16_jumprec",
-  "note": "Replaced the Beni512 checkpoint 19500 artifacts. No ONNX source is shipped, so there is no host-side numerical reference.",
   "sha256": {
     "models/fitted22500_dfp16_jumprec.rknn": "a8176c9bde0053757a1cae9e30ee38901f6def7b787670319f576fc9697e0f29",
     "models/fitted22500_normalizer.json": "6162a8ba67cf2fb765a35777cfc3b1b0df246491738cfd4e69f55382011462ec"

@@ -1,6 +1,6 @@
 # HCR1 — giao diện LF ↔ ESP32-S3 N16R8
 
-LF chạy **cả V3Controller đứng dậy và policy Beni512**. ESP32 lấy cảm biến,
+LF chạy **kế hoạch gập và policy**. ESP32 lấy cảm biến,
 ước lượng attitude, điều khiển servo/driver, và watchdog. ESP32 không cần GRU,
 ONNX, MuJoCo hoặc thuật toán quyết định chuyển controller.
 

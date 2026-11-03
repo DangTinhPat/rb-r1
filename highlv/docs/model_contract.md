@@ -2,13 +2,13 @@
 
 Model hiện dùng: `models/fitted22500_dfp16_jumprec.rknn` với `models/fitted22500_normalizer.json`
 (lấy từ `/userdata/lu_v13_gru256_hil/` trên LF). Recurrent GRU 512 chiều, policy 100 Hz.
-Thay cho Beni512 checkpoint 19500, nên không còn artifact ONNX và không còn backend ONNX.
+Không có artifact ONNX, nên runtime chỉ có backend RKNN.
 
 > **Chưa xác minh.** Phần dưới (observation 32D, action mapping, các command cố định) là contract
-> của model 19500 trước đây và được **giữ nguyên trong code**. Chưa có tài liệu nào xác nhận
-> model fitted22500 dùng cùng contract. Tên `jumprec` gợi ý model có thể dùng lệnh nhảy/hồi
-> phục (`obs[28:32]`, hiện cố định 0) hoặc scale action khác. Loader chỉ kiểm hình dạng tensor
-> (obs 32, hidden 512, action 6) và hash artifact; đúng sai về điều khiển chỉ biết khi chạy thật.
+> mà code đang giả định. Chưa có tài liệu nào xác nhận model fitted22500 dùng đúng contract này.
+> Tên `jumprec` gợi ý model có thể dùng lệnh nhảy/hồi phục (`obs[28:32]`, hiện cố định 0) hoặc
+> scale action khác. Loader chỉ kiểm hình dạng tensor (obs 32, hidden 512, action 6) và hash
+> artifact; đúng sai về điều khiển chỉ biết khi chạy thật.
 
 ## Input/output tensor
 
