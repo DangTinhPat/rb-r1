@@ -17,9 +17,9 @@ import time
 from .hybrid_core import HybridCore
 from .recovery import StandupProcess
 from .policy import Policy
-from .protocol import Parser, TELEMETRY
+from .protocol import Parser, TELEMETRY, ENCODER_HOME_ACK
 from .transport import Writer, open_serial
-from .dashboard import DashboardServer
+from .dashboard import DashboardProcess
 from .paths import PROJECT_ROOT, native_directory
 from .commands import parse_command
 
@@ -155,7 +155,7 @@ def main():
         command_listener.listen(2)
         command_listener.setblocking(False)
         if not args.no_web:
-            web = DashboardServer(
+            web = DashboardProcess(
                 args.web_host,
                 args.web_port,
                 args.web_token_file,
@@ -163,7 +163,12 @@ def main():
                 args.command_socket,
                 ROOT / "web/index.html",
             )
-            web.start()
+            try:
+                web.start()
+            except (OSError, ValueError, RuntimeError) as error:
+                log("web_unavailable", reason=str(error))
+                web.close()
+                web = None
         if listener:
             listener.listen(1)
             listener.setblocking(False)
@@ -180,7 +185,8 @@ def main():
             "ready",
             backend=cfg["backend"],
             transport=transport_name,
-            web=None if args.no_web else f"http://{args.web_host}:{args.web_port}",
+            web=None if web is None else f"http://{args.web_host}:{web.port}",
+            web_pid=None if web is None else web.process.pid,
             token_file=None if args.no_web else args.web_token_file,
         )
         while not stop:
@@ -211,6 +217,7 @@ def main():
                 snapshot = core.snapshot()
                 snapshot.update(
                     transport=transport_name,
+                    web_process_alive=web is not None and web.process.poll() is None,
                     parser_errors=parser.errors,
                     max_handler_ms=max_control_ms,
                     max_telemetry_ms=max_telemetry_ms,
@@ -257,6 +264,8 @@ def main():
                             if tail.strip():
                                 raise ValueError("send one command per connection")
                             op, vx, wz = parse_command(line)
+                            if op == "RESET_ENCODERS":
+                                last_status = 0.0
                             rejected = core.counters["rejected"]
                             reply = (
                                 core.estop()
@@ -321,6 +330,8 @@ def main():
                                     ),
                                     core.status(),
                                 ]
+                            if frame.kind == ENCODER_HOME_ACK:
+                                last_status = 0.0
                             writer.add(reply)
                         writer.flush()
                     except (OSError, RuntimeError) as error:

@@ -1,0 +1,4 @@
+# 1 ms tick: reply timeouts and the 4 ms control period are expressed in ticks
+CONFIG_FREERTOS_HZ=1000
+
+CONFIG_ESP_CONSOLE_NONE=y

@@ -97,7 +97,7 @@ def operator(path, data):
         return json.loads(response)
 
 
-def run_smoke_test():
+def run_smoke_test(with_web=False):
     checks = []
     with tempfile.TemporaryDirectory(prefix="rb-runtime-smoke-") as temp:
         temp = Path(temp)
@@ -121,7 +121,8 @@ def run_smoke_test():
                     str(temp / "status.json"),
                     "--realtime-priority",
                     "0",
-                    "--no-web",
+                    *(["--web-host", "127.0.0.1", "--web-port", "0",
+                       "--web-token-file", str(temp / "web.token")] if with_web else ["--no-web"]),
                 ],
                 cwd=ROOT,
                 env=env,
@@ -131,7 +132,19 @@ def run_smoke_test():
             peer = None
             try:
                 deadline = time.monotonic() + 10.0
-                while not wire.exists() or not command.exists():
+                ready = None
+                def ready_event():
+                    for line in (temp / "runtime.log").read_text().splitlines():
+                        try:
+                            event = json.loads(line)
+                        except ValueError:
+                            continue
+                        if event.get("event") == "ready":
+                            return event
+                    return None
+                while not wire.exists() or not command.exists() or (with_web and not ready):
+                    if with_web:
+                        ready = ready_event()
                     if process.poll() is not None or time.monotonic() > deadline:
                         log.seek(0)
                         raise RuntimeError(log.read())
@@ -154,10 +167,38 @@ def run_smoke_test():
                     client.sendall(b"RM\n")
                     result = json.loads(client.recv(512))
                     assert result["accepted"] and result["mode"] == "HOME"
+                # Diagnostics share MCU sequence ordering, but never generate
+                # a TARGET or replace the following TELEMETRY source sequence.
+                peer.send(p.EXECUTION_DIAG,
+                          p.EXECUTION_DIAG_DATA.pack(peer.epoch, 1, *([0] * 22)))
                 for _ in range(4):
                     time.sleep(0.005)
                     assert peer.tick()[2] == p.HOME_PD
                 checks.append("fragmented local ARM and HOME targets")
+                checks.append("optional MCU diagnostics interleaved with HOME samples")
+                if with_web:
+                    import signal
+                    from urllib.request import Request, urlopen
+                    # Freeze the actual HTTP process while the real LF core
+                    # continues receiving MCU samples. Only temporary sockets.
+                    web_pid = ready["web_pid"]
+                    assert web_pid and web_pid != process.pid
+                    os.kill(web_pid, signal.SIGSTOP)
+                    try:
+                        for _ in range(8):
+                            time.sleep(.005)
+                            assert peer.tick()[2] == p.HOME_PD
+                    finally:
+                        os.kill(web_pid, signal.SIGCONT)
+                    checks.append("web process frozen >TTL; control and applied ACK continue")
+                    token = (temp / "web.token").read_text().strip()
+                    for _ in range(2):
+                        request = Request(ready["web"] + "/api/status",
+                                          headers={"Authorization": "Bearer " + token})
+                        with urlopen(request, timeout=1.0) as response:
+                            assert json.load(response)["mode"] == "HOME"
+                        assert peer.tick()[2] == p.HOME_PD
+                    checks.append("HTTP resumes/reloads without changing HOME or replaying commands")
                 peer.send(p.TELEMETRY, peer.sample.encode(), corrupt=True)
                 time.sleep(0.005)
                 assert peer.tick()[2] == p.HOME_PD
@@ -194,8 +235,9 @@ def run_smoke_test():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--report", type=Path)
+    parser.add_argument("--with-web", action="store_true", help="also check isolated HTTP outage/recovery")
     args = parser.parse_args()
-    report = run_smoke_test()
+    report = run_smoke_test(args.with_web)
     text = json.dumps(report, indent=2) + "\n"
     if args.report:
         args.report.parent.mkdir(parents=True, exist_ok=True)

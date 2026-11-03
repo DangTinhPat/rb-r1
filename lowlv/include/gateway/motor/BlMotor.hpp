@@ -1,5 +1,6 @@
 #pragma once
 #include "gateway/motor/MotorBackend.hpp"
+#include "gateway/motor/hal/MotorMapping.hpp"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -18,7 +19,7 @@ struct MotorGuard {
   ~MotorGuard() { lock.leave(); }
 };
 enum class BusFormat { Joint, Wheel };
-enum class BusError : std::uint8_t { None, Unavailable, Packet, Tx, EchoTimeout, EchoMismatch, ReplyTimeout, ReplyInvalid, ReadbackMismatch, Deadline, Cancelled, Quiet };
+enum class BusError : std::uint8_t { None, Unavailable, Packet, Tx, EchoTimeout, EchoMismatch, ReplyTimeout, ReplyInvalid, ReadbackMismatch, Deadline, Cancelled, Quiet, WriteEchoOnly };
 struct BusPermit {
   std::uint64_t deadline_us=0;
   bool (*valid)(void*)=nullptr;
@@ -46,6 +47,8 @@ class MotorBus {
  public:
   virtual ~MotorBus() = default;
   virtual std::uint64_t now() const noexcept = 0;
+  // A wheel configured for read-only replies still requires target readback.
+  virtual void setWheelWriteReplies(bool) noexcept {}
   virtual BusError lastError() const noexcept { return BusError::Unavailable; }
   virtual BusTrace trace() const noexcept { return {}; }
   virtual BusStats stats() const noexcept { return {}; }
@@ -60,8 +63,8 @@ class MotorBus {
  protected:
   BusPermit permit_{};
 };
-// Host reference codec for the mock-bus tests. The firmware builds and parses
-// packets in third_party/bl4012e/src/joint_bus.c instead.
+// Lumi-Quantum codec adapter. Production MIT encoding and post-transport reply
+// validation use this codec; joint_bus.c retains guarded physical I/O.
 std::size_t motorPacket(std::uint8_t id, std::uint8_t instruction,
                         const std::uint8_t* params, std::size_t count,
                         std::array<std::uint8_t,48>& out) noexcept;
@@ -70,16 +73,24 @@ bool motorReply(BusFormat, std::uint8_t id, std::uint8_t instruction,
                  const std::uint8_t* bytes, std::size_t count,
                  std::size_t read_count, BusReply&) noexcept;
 
-// Default gains. Readback on 2026-10-30: the drivers on both buses cap hip
-// Kp at 20 and Kd at 0.120.
-struct MotorGains { float kp = 10.F, kd = .12F; };
+// Lumi-Quantum BoardConfig: hip 10/.036, knee 20/.05, checked against driver caps.
+struct MotorGains { float kp = 10.F, kd = .036F; };
 struct BlMotorConfig {
-  // Index by MODEL side: 0=left UART2/GPIO15, 1=right UART1/GPIO17.
-  // Order inside each side: hip, crank, wheel. User confirmed side mapping.
-  std::array<std::array<int,3>,2> sign{{{{1,-1,1}},{{-1,1,-1}}}};
-  std::array<std::uint8_t,3> id{{2,3,1}};
-  // Per-profile gains, tuned independently on the bench.
-  std::array<MotorGains,3> profile{{{}, {}, {}}}; // HOME, RECOVERY, POLICY
+  // Model side 0=left UART2/GPIO15, 1=right UART1/GPIO17; hip, second joint, wheel.
+  std::array<std::array<int,3>,2> sign{{
+    {{int(hal::motor_mapping::kLegBindings[0].driver_sign),
+      int(hal::motor_mapping::kLegBindings[1].driver_sign),
+      int(hal::motor_mapping::kWheelBindings[0].driver_sign)}},
+    {{int(hal::motor_mapping::kLegBindings[2].driver_sign),
+      int(hal::motor_mapping::kLegBindings[3].driver_sign),
+      int(hal::motor_mapping::kWheelBindings[1].driver_sign)}}}};
+  std::array<std::uint8_t,3> id{{hal::motor_mapping::kHipId,
+    hal::motor_mapping::kKneeId, hal::motor_mapping::kWheelId}};
+  // Physical second joint d = coupling * hip + knee. Lumi hardware measures knee.
+  // HCR1 always carries virtual crank phi = hip + knee, independent of this choice.
+  float knee_crank_coupling = hal::motor_mapping::kKneeCrankCoupling;
+  std::array<MotorGains,3> profile{{{}, {}, {}}}; // hip HOME, RECOVERY, POLICY
+  std::array<MotorGains,3> knee_profile{{{20.F,.05F}, {20.F,.05F}, {20.F,.05F}}};
   float wheel_max_rpm = 950.F; // bench command cap, not the rated speed
   float recovery_wheel_tau_s = .075F;
   float hip_min = -1.56817833F, hip_max = 2.35706715F;
@@ -91,6 +102,7 @@ enum class MotorError : std::uint32_t {
   None, Bus, Status, Configuration, Range, Expired, Feedback, Cancelled, Startup
 };
 enum class FeedbackError : std::uint8_t { None, JointJump, WheelRange, WheelGap, WheelAmbiguous };
+enum class BatchClaim { Claimed, Superseded, Expired, Cancelled };
 struct MotorBatch {
   std::uint64_t token = 0, deadline_us = 0;
   std::uint32_t generation = 0, epoch = 0, seq = 0;
@@ -105,6 +117,14 @@ struct MotorRequest {
   MotorBatch batch{};
   std::uint32_t off_test_requested=0;
 };
+struct MotorFaultContext {
+  std::uint64_t at_us=0, lease_us=0, batch_deadline_us=0;
+  std::uint32_t batch_seq=0;
+  std::uint8_t id=0, instruction=0, address=0;
+  bool during_io=false, expired_lease=false, expired_batch=false;
+  BusError bus_error=BusError::None;
+  BusTrace trace{};
+};
 struct MotorLegState {
   bool configured = false, off = false, prepared = false, wheel_ready = false;
   std::uint32_t generation = 0, reset_generation = 0;
@@ -114,6 +134,7 @@ struct MotorLegState {
   std::array<std::uint8_t,3> status{};
   std::uint64_t completed = 0;
   std::uint32_t transactions = 0, errors = 0, cycle_max_us = 0;
+  std::uint32_t active_cycle_us=0, active_cycle_max_us=0, active_io_us=0, active_io_max_us=0;
   std::uint32_t off_test_done=0;
   std::uint32_t recovered_writes = 0, retries = 0, recovered_transactions = 0, skipped_writes = 0;
   BusStats bus_stats{};
@@ -123,6 +144,7 @@ struct MotorLegState {
   std::array<std::uint8_t,3> torque_enable{{255,255,255}};
   std::int16_t startup_wheel_goal_rpm = 0;
   MotorError error = MotorError::None;
+  MotorFaultContext fault_context{}; // frozen when this worker first latches a fault
   FeedbackError feedback_error = FeedbackError::None;
   std::uint8_t feedback_id = 0;
   std::int32_t feedback_previous = 0, feedback_received = 0;
@@ -156,10 +178,15 @@ class BlMotorBackend : public MotorBackend {
                     MotorApplied&) noexcept override;
   // Explicit manual reference capture; never assumes the boot pose is home.
   // The caller must ensure GatewayCore is disarmed. Values are hipL,R,kneeL,R.
-  bool captureHome(const std::array<float,4>& model_q, std::uint64_t now) noexcept;
+  bool captureHome(const std::array<float,4>& model_q, std::uint64_t now) noexcept override;
   BlMotorDiagnostics diagnostics() const noexcept;
+  MotorExecutionStats executionStats(std::uint64_t now) const noexcept override;
+  BatchClaim claimBatch(unsigned side, const MotorBatch&, std::uint64_t now) noexcept;
   MotorRequest request(unsigned side) const noexcept;
   void publish(unsigned side, const MotorLegState&) noexcept;
+  // Publish only a validated sensor sample between bus I/Os. This must not
+  // expose a batch completion or change prepared/OFF state before step ends.
+  void publishSample(unsigned side, unsigned motor, const MotorLegState&) noexcept;
   void trip(MotorError) noexcept;
   const BlMotorConfig& config() const noexcept { return config_; }
  private:
@@ -173,6 +200,8 @@ class BlMotorBackend : public MotorBackend {
   std::array<MotorLegState,2> state_{};
   std::array<std::array<float,3>,2> zero_{};
   MotorApplied completed_{}, pending_{};
+  std::array<std::uint64_t,2> batch_started_{};
+  std::uint32_t superseded_=0, applied_latency_max_us_=0;
   std::uint64_t token_ = 0, applied_at_ = 0, pending_at_ = 0;
   std::uint32_t latest_epoch_ = 0, latest_seq_ = 0;
   bool homed_ = false, in_flight_ = false, have_complete_ = false, have_latest_ = false, maintenance_ = false;
@@ -193,6 +222,7 @@ class BlMotorWorker {
   bool transact(unsigned motor, std::uint8_t instruction,
                 const std::uint8_t* p, std::size_t n, std::size_t read = 0,
                 BusReply* out = nullptr) noexcept;
+  bool writeVerified(unsigned motor, std::uint8_t address, std::uint8_t value) noexcept;
   bool torque(unsigned motor, bool enable) noexcept;
   bool wheelSpeed(std::int16_t rpm) noexcept;
   bool wheelRead() noexcept;
@@ -216,7 +246,10 @@ class BlMotorWorker {
   std::uint64_t wheel_enabled_at_ = 0, last_idle_poll_ = 0, last_off_attempt_ = 0, last_off_verify_ = 0;
   bool wheel_sample_ = false, wheel_zero_verified_ = false;
   MotorRequest guard_request_{};
+  bool request_in_progress_=false;
+  std::uint8_t request_id_=0, request_instruction_=0, request_address_=0;
   bool guard_active_=false;
+  bool batch_io_=false, was_active_=false;
   BusError request_error_=BusError::None;
   std::int16_t wheel_goal_rpm_=0;
   std::uint64_t wheel_goal_at_=0;

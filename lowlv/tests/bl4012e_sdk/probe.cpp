@@ -140,6 +140,17 @@ int main(void){
   // Even a valid frame is rejected if it completes beyond the budget.
   prepare(mit_rx,sizeof mit_rx);b.drain=false;b.deadline_us=clock_us+1500;read_delay_us=2000;r.pos=123;
   assert(bus_write_mit(&b,1,&cmd,&r)!=ESP_OK && b.last_error==JB_ERROR_DEADLINE && r.pos==123);
+  // The final fraction of an RTOS tick is still usable. Buffered echo/reply
+  // must not be rejected as expired just because floor(remaining/1 ms)==0.
+  prepare(mit_rx,sizeof mit_rx);b.drain=false;b.idle_since_us=clock_us;
+  b.deadline_us=clock_us+800;auto sub_tick_deadline=b.deadline_us;
+  assert(bus_write_mit(&b,1,&cmd,&r)==ESP_OK && b.last_error==JB_ERROR_NONE);
+  assert(clock_us<sub_tick_deadline && r.pos==4096);
+  // Missing bytes still stop at the original deadline; never fabricate ACK.
+  prepare(NULL,0);b.drain=false;b.idle_since_us=clock_us;
+  b.deadline_us=clock_us+800;sub_tick_deadline=b.deadline_us;r.pos=123;
+  assert(bus_write_mit(&b,1,&cmd,&r)!=ESP_OK && b.last_error==JB_ERROR_DEADLINE && r.pos==123);
+  assert(clock_us>=sub_tick_deadline && clock_us-sub_tick_deadline<50);
   b.deadline_us=0;b.permit=nullptr;
   prepare(mit_rx,sizeof mit_rx);b.drain=false;
   assert(bus_write_mit(&b,1,&cmd,&r)==ESP_OK);
@@ -156,6 +167,15 @@ int main(void){
   assert(adapter.request(BusFormat::Wheel,1,2,read_params,2,6,decoded));
   same(wheel_tx,sizeof wheel_tx);assert(decoded.data[4]==0xf6 && decoded.data[5]==0xff);
   assert(adapter.trace().expected==15 && adapter.trace().rx_count==15);
+  // The live adapter's Lumi parser accepts only the same validated one-FF repair.
+  prepare(lost,sizeof lost);auto restored=adapter.stats().sync;
+  assert(adapter.request(BusFormat::Wheel,1,2,read_params,2,6,decoded));
+  assert(adapter.trace().sync_restored && adapter.stats().sync==restored+1);
+  assert(decoded.data[0]==0x2e && decoded.data[1]==3);
+  prepare(lost,sizeof lost);response[8]^=1;
+  assert(!adapter.request(BusFormat::Wheel,1,2,read_params,2,6,decoded));
+  assert(adapter.lastError()==BusError::ReplyInvalid);
+
   const unsigned char mit_params[]={0x1a,0x10,0x27,0x24,0,0,0x10,0,0,0,0};
   prepare(mit_rx,sizeof mit_rx);
   assert(adapter.request(BusFormat::Joint,1,3,mit_params,sizeof mit_params,0,decoded));
@@ -204,6 +224,38 @@ int main(void){
   assert(!adapter.request(BusFormat::Wheel,1,2,read_params,2,6,decoded));
   assert(adapter.lastError()==BusError::Cancelled && writes==tx_before);
   adapter.setPermit({});
+  // Lumi no-write-reply wheel mode: an exact echo is insufficient for applied ACK.
+  // The backend must read the register; the transport returns WriteEchoOnly.
+  adapter.setWheelWriteReplies(false);prepare(NULL,0);decoded.position=1234;
+  auto started=clock_us;
+  assert(!adapter.request(BusFormat::Wheel,1,3,speed_params,3,0,decoded));
+  assert(adapter.lastError()==BusError::WriteEchoOnly && decoded.position==1234);
+  assert(adapter.trace().expected==0 && adapter.trace().echo_count==9 && adapter.trace().rx_count==0);
+  assert(clock_us-started>=120 && clock_us-started<1500); // no 9 ms reply timeout
+  prepare(NULL,0);corrupt_echo=1;
+  assert(!adapter.request(BusFormat::Wheel,1,3,speed_params,3,0,decoded));
+  assert(adapter.lastError()==BusError::EchoMismatch);
+  prepare(NULL,0);short_echo=1;
+  assert(!adapter.request(BusFormat::Wheel,1,3,speed_params,3,0,decoded));
+  assert(adapter.lastError()==BusError::EchoTimeout);
+  // Deadline/cancellation during the settle phase must not return WriteEchoOnly.
+  // First clean up a failed exchange; the adapter has a private late-drain latch.
+  prepare(NULL,0);
+  assert(!adapter.request(BusFormat::Wheel,1,3,speed_params,3,0,decoded));
+  assert(adapter.lastError()==BusError::WriteEchoOnly);
+  prepare(NULL,0);clock_us+=100;cancel_on_delay=true;
+  adapter.setPermit({0,allow,nullptr});
+  assert(!adapter.request(BusFormat::Wheel,1,3,speed_params,3,0,decoded));
+  assert(adapter.lastError()==BusError::Cancelled);
+  prepare(NULL,0);adapter.setPermit({});
+  assert(!adapter.request(BusFormat::Wheel,1,3,speed_params,3,0,decoded));
+  assert(adapter.lastError()==BusError::WriteEchoOnly);
+  prepare(NULL,0);clock_us+=100;
+  read_delay_us=100; // echo delivery + 120 us settle genuinely exceeds 200 us
+  adapter.setPermit({static_cast<uint64_t>(clock_us+200),nullptr,nullptr});
+  assert(!adapter.request(BusFormat::Wheel,1,3,speed_params,3,0,decoded));
+  assert(adapter.lastError()==BusError::Deadline);
+  adapter.setPermit({});adapter.setWheelWriteReplies(true);
 #endif
   return 0;
 }

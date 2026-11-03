@@ -12,11 +12,12 @@ using namespace gateway;
 // Test double only. Never linked into the ESP32 firmware.
 struct TestMotors final : MotorBackend {
   bool available = true, fail_apply = false, bad_feedback = false, off_confirmed = true;
-  unsigned applications = 0, disables = 0;
+  unsigned applications = 0, disables = 0, homes = 0;
+  std::uint64_t encoder_age_us=0;
   HcrTarget last_target{};
   bool ready() const noexcept override { return available; }
   MotorFeedback feedback(std::uint64_t now) noexcept override {
-    MotorFeedback f{}; f.stamp_us = now;
+    MotorFeedback f{}; f.stamp_us = now-encoder_age_us;
     f.q = {2.35706715F,2.35706715F,0,0,0,0};
     f.encoders_valid = f.homed = available;
     if (bad_feedback) f.q[0] = std::numeric_limits<float>::quiet_NaN();
@@ -24,6 +25,10 @@ struct TestMotors final : MotorBackend {
   }
   void disable() noexcept override { ++disables; }
   bool disabled() const noexcept override { return off_confirmed; }
+  bool captureHome(const std::array<float,4>& pose, std::uint64_t) noexcept override {
+    assert(pose[0]==2.35706715F && pose[1]==2.35706715F && pose[2]==0 && pose[3]==0);
+    ++homes; return available && off_confirmed;
+  }
   ApplyResult apply(const HcrTarget& t, std::uint32_t seq, std::uint64_t,
                     std::uint64_t, MotorApplied& out) noexcept override {
     ++applications;
@@ -71,6 +76,116 @@ unsigned arm(GatewayCore& core, std::uint64_t now) {
 }
 
 void tests() {
+  { // Freeze the missing sensor/age at the fault, before OFF/recovery hides it.
+    for(bool stale_imu:{false,true}) {
+      TestMotors m;GatewayCore c(m);const auto source=arm(c,100000);
+      c.receive(target(source),100001);sensors(c,100001);
+      assert(c.diagnostics(100001).armed);
+      if(stale_imu) {
+        c.tick(110002); // IMU 10001 us old; TARGET still within its 20 ms lease.
+      } else {
+        m.encoder_age_us=20001;sensors(c,100002);
+      }
+      const auto fault=c.diagnostics(stale_imu?110002:100002);
+      assert(fault.fault==LocalFault::Sensors && !fault.armed && !fault.enabled);
+      const auto frozen=fault.sensor_fault;
+      assert(frozen.motor_ready);
+      if(stale_imu) {
+        assert(!(frozen.flags&HCR_IMU_OK) && (frozen.flags&HCR_ENCODER_OK));
+        assert(frozen.at_us-frozen.imu_stamp_us==10001);
+      } else {
+        assert((frozen.flags&HCR_IMU_OK) && !(frozen.flags&HCR_ENCODER_OK));
+        assert(frozen.at_us-frozen.encoder_stamp_us==20001);
+      }
+      m.encoder_age_us=0;sensors(c,115000);
+      const auto recovered=c.diagnostics(115000);
+      assert((recovered.telemetry_flags&7)==7);
+      assert(recovered.sensor_fault.at_us==frozen.at_us);
+      assert(recovered.sensor_fault.flags==frozen.flags);
+      assert(recovered.fault==LocalFault::Sensors); // fresh data cannot clear latch
+      assert(c.clearLocalFault());assert(!c.diagnostics(115000).sensor_fault.at_us);
+    }
+  }
+  { // Independent fixed vector also checked by the LF codecs, no shared build.
+    const char* hex="a55a0106600000000900000040e201000000000007000000010000000200000003000000"
+      "0400000005000000060000000700000008000000090000000a0000000b0000000c000000"
+      "0d0000000e0000000f000000100000001100000012000000130000001400000015000000"
+      "16000000170000007d72bbac";
+    std::uint32_t v[HCR_EXECUTION_DIAG_WORDS];
+    for(unsigned i=0;i<HCR_EXECUTION_DIAG_WORDS;++i)v[i]=i;
+    v[0]=7;v[1]=1;WirePacket p{};
+    p.size=hcr_execution_diagnostics(p.bytes.data(),p.bytes.size(),9,123456,v);
+    assert(p.size==120 && std::strlen(hex)==240);
+    const auto nibble=[](char c){return c<='9'?c-'0':c-'a'+10;};
+    for(unsigned i=0;i<p.size;++i)assert(p.bytes[i]==(nibble(hex[2*i])*16+nibble(hex[2*i+1])));
+  }
+  { // Optional diagnostic packets cannot serve as TARGET source or renew TTL.
+    TestMotors m;GatewayCore c(m);const auto source=arm(c,100000);
+    auto d=decode(c.executionDiagnostics(100000));
+    assert(d.type==HCR_EXECUTION_DIAG && d.size==96);
+    assert(hcr_u32(d.payload)==7 && hcr_u32(d.payload+4)==1);
+    assert(hcr_u32(d.payload+4*HCR_DIAG_TARGET_RX_AGE_US)==UINT32_MAX);
+    assert(hcr_u32(d.payload+4*HCR_DIAG_FLAGS)==0); // unsupported fake backend
+    c.receive(target(d.seq),100001);assert(c.diagnostics(100001).rejected==1);
+    c.receive(target(source,4),100002,100001);sensors(c,100002);
+    assert(c.diagnostics(100002).enabled);
+    d=decode(c.executionDiagnostics(100010));
+    assert(hcr_u32(d.payload+4*HCR_DIAG_TARGET_RX_AGE_US)==9);
+    assert(hcr_u32(d.payload+4*HCR_DIAG_RX_QUEUE_MAX_US)==1);
+    for(unsigned t=105000;t<120001;t+=5000){sensors(c,t);c.executionDiagnostics(t);}
+    sensors(c,120001);assert(c.diagnostics(120001).fault==LocalFault::TargetTimeout);
+    c.enterMaintenance();assert(!c.executionDiagnostics(120002).size);
+  }
+  { // Software HOME is disarmed only; exact source/sequence/epoch, no motor apply.
+    TestMotors m;GatewayCore c(m);c.receive(hello(),100000);sensors(c,100000);
+    auto source=sentTelemetry(c,100000);
+    HcrFrame f{};f.type=HCR_ENCODER_HOME;f.size=8;f.seq=3;f.stamp_us=3;
+    hcr_put32(f.payload,7);hcr_put32(f.payload+4,source);
+    const std::uint8_t request_vector[]={0xa5,0x5a,0x01,0x83,0x08,0x00,0x00,0x00,0x03,0x00,0x00,0x00,0x03,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x07,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x65,0x39,0xd1,0x11};
+    const std::uint8_t ack_vector[]={0xa5,0x5a,0x01,0x05,0x0c,0x00,0x00,0x00,0x02,0x00,0x00,0x00,0xa1,0x86,0x01,0x00,0x00,0x00,0x00,0x00,0x07,0x00,0x00,0x00,0x03,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0xeb,0x8d,0xa1,0xa6};
+    WirePacket request{};
+    request.size=hcr_encode(request.bytes.data(),request.bytes.size(),f.type,f.seq,f.stamp_us,f.payload,f.size);
+    assert(request.size==sizeof request_vector && !std::memcmp(request.bytes.data(),request_vector,sizeof request_vector));
+    const auto reply=c.receive(decode(request),100001);
+    assert(reply.size==sizeof ack_vector && !std::memcmp(reply.bytes.data(),ack_vector,sizeof ack_vector));
+    auto ack=decode(reply);
+    assert(ack.type==HCR_ENCODER_HOME_ACK && ack.size==12);
+    assert(hcr_u32(ack.payload)==7 && hcr_u32(ack.payload+4)==3 && hcr_u32(ack.payload+8)==HCR_HOME_APPLIED);
+    assert(m.homes==1 && m.applications==0 && !c.diagnostics(100001).armed);
+    assert(!c.receive(f,100002).size && m.homes==1); // no duplicate capture
+    f.seq=4;f.stamp_us=4;m.off_confirmed=false;
+    assert(hcr_u32(decode(c.receive(f,100003)).payload+8)==HCR_HOME_NOT_OFF && m.homes==1);
+    m.off_confirmed=true;f.seq=5;f.stamp_us=5;
+    assert(hcr_u32(decode(c.receive(f,131000)).payload+8)==HCR_HOME_FEEDBACK && m.homes==1);
+    f.seq=6;f.stamp_us=6;hcr_put32(f.payload,99);
+    assert(!c.receive(f,131001).size && m.homes==1);
+  }
+  { // HOME cannot bypass E-stop or a current TARGET deadline, even with fresh sensors.
+    TestMotors m;GatewayCore c(m);auto source=arm(c,100000);
+    c.receive(target(source),100001);
+    HcrFrame f{};f.type=HCR_ENCODER_HOME;f.size=8;f.seq=4;f.stamp_us=4;
+    hcr_put32(f.payload,7);hcr_put32(f.payload+4,source);
+    assert(hcr_u32(decode(c.receive(f,100002)).payload+8)==HCR_HOME_NOT_OFF && m.homes==0);
+    sensors(c,120001);assert(c.diagnostics(120001).fault==LocalFault::TargetTimeout);
+    c.receive(statusFrame(1,5),120002); // LF disabled; timeout remains latched
+    f.seq=6;f.stamp_us=6;
+    assert(hcr_u32(decode(c.receive(f,120002)).payload+8)==HCR_HOME_REFUSED && m.homes==0);
+    c.estop();f.seq=7;f.stamp_us=7;
+    assert(hcr_u32(decode(c.receive(f,120003)).payload+8)==HCR_HOME_REFUSED && m.homes==0);
+  }
+  { // Startup calibration fault permits capture; other LF faults do not.
+    TestMotors m;GatewayCore c(m);c.receive(hello(),100000);sensors(c,100000);
+    const auto source=sentTelemetry(c,100000);
+    auto status=statusFrame(6,2);hcr_put32(status.payload+8,2);c.receive(status,100001);
+    HcrFrame f{};f.type=HCR_ENCODER_HOME;f.size=8;f.seq=3;f.stamp_us=3;
+    hcr_put32(f.payload,7);hcr_put32(f.payload+4,source);
+    assert(hcr_u32(decode(c.receive(f,100002)).payload+8)==HCR_HOME_APPLIED && m.homes==1);
+    assert(c.diagnostics(100002).fault==LocalFault::RemoteFault); // not cleared by capture
+    status.seq=4;status.stamp_us=4;hcr_put32(status.payload+8,3);c.receive(status,100003);
+    f.seq=5;f.stamp_us=5;
+    assert(hcr_u32(decode(c.receive(f,100004)).payload+8)==HCR_HOME_REFUSED && m.homes==1);
+  }
+
   { // OTA interrupts active control; neither RESET nor a fresh LF epoch can unlock it.
     TestMotors m; GatewayCore c(m); const auto ref = arm(c,100000);
     c.receive(target(ref),100001); sensors(c,100500);

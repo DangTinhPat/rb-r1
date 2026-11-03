@@ -4,3 +4,9 @@ __pycache__/
 *.py[cod]
 wifi_secrets.h
 secrets.local*.ini
+bench_secrets.h
+sdkconfig
+sdkconfig.old
+.local/
+sdkconfig.*
+!sdkconfig.defaults

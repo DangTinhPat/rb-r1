@@ -26,8 +26,8 @@ bool EspMotorBus::request(BusFormat fmt, std::uint8_t id, std::uint8_t inst,
   // HCR requires an individual reply; broadcasts must never produce an ACK.
   const bool ping=inst==1 && n==0 && reads==0;
   const bool read=inst==2 && n==2 && p && reads>0 &&
-                  reads<=reply.data.size() && p[1]==reads;
-  const bool write=inst==3 && n>=1 && n<=42 && p && reads==0;
+                  reads<=(fmt==BusFormat::Wheel?6U:8U) && p[1]==reads;
+  const bool write=inst==3 && n>=1 && n<=17 && p && reads==0;
   if (id==0 || id>=0xfe || (fmt!=BusFormat::Joint && fmt!=BusFormat::Wheel) ||
       !(ping || read || write)) { error_=BusError::Packet; return false; }
   const auto format=fmt==BusFormat::Wheel?JB_FMT_WHEEL:JB_FMT_JOINT;
@@ -40,6 +40,8 @@ bool EspMotorBus::request(BusFormat fmt, std::uint8_t id, std::uint8_t inst,
   esp_err_t rc;
   if (ping) rc=bus_ping(&bus_,format,id,&result);
   else if (read) rc=bus_read(&bus_,format,id,p[0],reads,decoded.data.data(),&result);
+  else if (fmt==BusFormat::Wheel && !wheel_write_replies_)
+    rc=bus_wheel_write_echo(&bus_,id,p[0],p+1,n-1);
   else rc=bus_write(&bus_,format,id,p[0],p+1,n-1,&result);
   switch (bus_.last_error) {
     case JB_ERROR_NONE: error_=rc==ESP_OK?BusError::None:BusError::Packet; break;
@@ -62,7 +64,18 @@ bool EspMotorBus::request(BusFormat fmt, std::uint8_t id, std::uint8_t inst,
   std::copy_n(t.echo,trace_.echo.size(),trace_.echo.begin());
   std::copy_n(t.rx,trace_.rx.size(),trace_.rx.begin());
   if (rc!=ESP_OK) return false;
-  decoded.status=result.status; decoded.position=result.pos;
+  if (write && fmt==BusFormat::Wheel && !wheel_write_replies_) {
+    error_=BusError::WriteEchoOnly; return false; // requires register readback, never a fabricated ACK
+  }
+  // Validate with the Lumi codec too. Preserve raw trace; restore exactly the
+  // one leading FF already accepted by the guarded C transport, if necessary.
+  std::array<std::uint8_t,32> response{};
+  const unsigned offset=t.sync_restored?1U:0U;
+  if (offset) response[0]=0xff;
+  std::copy_n(t.rx,t.rx_count,response.begin()+offset);
+  if (!motorReply(fmt,id,inst,n?p[0]:0,n+2,response.data(),t.rx_count+offset,reads,decoded)) {
+    error_=BusError::ReplyInvalid; return false;
+  }
   reply=decoded;
   return true;
 }

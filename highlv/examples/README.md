@@ -20,3 +20,8 @@ sau một phản hồi. Nếu mất phản hồi quá 8 giây, script báo FAIL.
 ESP cũng in cả hai dòng trên console
 USB native hoặc console Wi-Fi TCP 8023. Đây là test UART bằng văn bản, không sử dụng frame HCR1; tên file
 được giữ từ example ban đầu.
+
+## GUI kiểm tra motor
+
+Xem [check_motor/README.md](check_motor/README.md): GUI web chạy trên LF, lệnh
+đi qua UART đến ESP, điều khiển sáu motor và đọc feedback bus.

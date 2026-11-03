@@ -108,7 +108,20 @@ static int read_bounded(joint_bus_t *bus, uint8_t *dst, size_t n, TickType_t tic
   if (bus->deadline_us) {
     const int64_t remaining = bus->deadline_us - esp_timer_get_time();
     const TickType_t available = remaining > 0 ? remaining / (portTICK_PERIOD_MS * 1000) : 0;
-    if (!available && ticks) { bus->last_error = JB_ERROR_DEADLINE; return -1; }
+    if (!available && ticks) {
+      // A positive sub-tick remainder is not an expired deadline. Echo/reply
+      // may already be buffered; use nonblocking reads for this final <1 tick
+      // rather than refusing valid data or blocking for a whole RTOS tick.
+      size_t got = 0;
+      while (got < n) {
+        if (!permitted(bus)) return -1;
+        const int count = uart_read_bytes(bus->uart, dst + got, n - got, 0);
+        if (count < 0) return count;
+        got += (size_t)count;
+        if (got < n) esp_rom_delay_us(10);
+      }
+      return (int)got;
+    }
     if (ticks > available) ticks = available;
   }
   return uart_read_bytes(bus->uart, dst, n, ticks);
@@ -266,7 +279,7 @@ static esp_err_t transact(joint_bus_t *bus, const uint8_t *tx, size_t tx_len, ui
 
 static esp_err_t request(joint_bus_t *bus, jb_format_t fmt, uint8_t id, uint8_t inst,
                          const uint8_t *params, uint8_t n_params, uint8_t *data, uint8_t data_len,
-                         joint_reply_t *reply) {
+                         bool expect_reply, joint_reply_t *reply) {
   bus->last_error = JB_ERROR_NONE;
   memset(&bus->trace, 0, sizeof(bus->trace));
   uint8_t tx[MAX_FRAME];
@@ -274,7 +287,7 @@ static esp_err_t request(joint_bus_t *bus, jb_format_t fmt, uint8_t id, uint8_t 
   const bool wheel = fmt == JB_FMT_WHEEL;
   const size_t echo_at = wheel ? 5 : 7;  // PRE_LEN PRE_INST PRE_P1
   const size_t tx_len = (size_t)n_params + 6;
-  const size_t rx_len = id == BROADCAST_ID ? 0 : (size_t)data_len + echo_at + 4;
+  const size_t rx_len = id == BROADCAST_ID || !expect_reply ? 0 : (size_t)data_len + echo_at + 4;
   if (tx_len > sizeof(tx) || rx_len > sizeof(rx)) {
     bus->last_error = JB_ERROR_PACKET;
     return ESP_ERR_INVALID_SIZE;
@@ -292,6 +305,14 @@ static esp_err_t request(joint_bus_t *bus, jb_format_t fmt, uint8_t id, uint8_t 
 
   esp_err_t err =
       transact(bus, tx, tx_len, rx, rx_len, wheel ? RX_TIMEOUT_WHEEL : RX_TIMEOUT_JOINT);
+  if (err == ESP_OK && !expect_reply) {
+    // Lumi-Quantum wheel mode: do not spend the 9 ms reply window waiting for
+    // a write ACK that response level <2 explicitly disables.
+    esp_rom_delay_us(120);
+    bus->idle_since_us = esp_timer_get_time();
+    bus->trace.total_us += 120;
+    if (!permitted(bus)) { ++bus->aborted; bus->drain = true; return ESP_ERR_TIMEOUT; }
+  }
   if (err != ESP_OK || rx_len == 0) {
     return err;
   }
@@ -320,7 +341,7 @@ static esp_err_t request(joint_bus_t *bus, jb_format_t fmt, uint8_t id, uint8_t 
 }
 
 esp_err_t bus_ping(joint_bus_t *bus, jb_format_t fmt, uint8_t id, joint_reply_t *reply) {
-  return request(bus, fmt, id, INST_PING, NULL, 0, NULL, 0, reply);
+  return request(bus, fmt, id, INST_PING, NULL, 0, NULL, 0, true, reply);
 }
 
 esp_err_t bus_write(joint_bus_t *bus, jb_format_t fmt, uint8_t id, uint8_t addr,
@@ -331,7 +352,19 @@ esp_err_t bus_write(joint_bus_t *bus, jb_format_t fmt, uint8_t id, uint8_t addr,
   }
   params[0] = addr;
   memcpy(&params[1], data, len);
-  return request(bus, fmt, id, INST_WRITE, params, len + 1, NULL, 0, reply);
+  return request(bus, fmt, id, INST_WRITE, params, len + 1, NULL, 0, true, reply);
+}
+
+esp_err_t bus_wheel_write_echo(joint_bus_t *bus, uint8_t id, uint8_t addr,
+                              const uint8_t *data, uint8_t len) {
+  if (!id || id >= BROADCAST_ID || len > 16 || (len && !data)) {
+    bus->last_error = JB_ERROR_PACKET;
+    return ESP_ERR_INVALID_ARG;
+  }
+  uint8_t params[17];
+  params[0] = addr;
+  if (len) memcpy(params + 1, data, len);
+  return request(bus, JB_FMT_WHEEL, id, INST_WRITE, params, len + 1, NULL, 0, false, NULL);
 }
 
 esp_err_t bus_read(joint_bus_t *bus, jb_format_t fmt, uint8_t id, uint8_t addr, uint8_t len,
@@ -340,7 +373,7 @@ esp_err_t bus_read(joint_bus_t *bus, jb_format_t fmt, uint8_t id, uint8_t addr, 
     return ESP_ERR_INVALID_ARG;
   }
   const uint8_t params[2] = {addr, len};
-  return request(bus, fmt, id, INST_READ, params, 2, out, len, reply);
+  return request(bus, fmt, id, INST_READ, params, 2, out, len, true, reply);
 }
 
 esp_err_t bus_write_mit(joint_bus_t *bus, uint8_t id, const joint_mit_cmd_t *cmd,

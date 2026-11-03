@@ -13,10 +13,9 @@ using rb::recovery::StandUp;
 
 static RecoveryController::Config config() {
   auto c = rb::recovery::defaultRecoveryConfig();
-  c.standup = StandUp::tunedRecoveryRb(.075F);
+  c.standup = StandUp::tunedRecoveryRb();
   c.standup.enabled = true;
   c.standup.hold_at_kneel = false;
-  c.standup.catch_wheel_lead_s = .075F;
   c.imu_home_zero = false;
   c.lqr.sampling_period_s = .005F;
   return c;
@@ -38,8 +37,6 @@ static const RecoveryController &preparedController() {
 struct StandupAdapter {
   RecoveryController controller{preparedController()};
   std::array<float, 4> previous{}, ff{};
-  std::array<std::array<float, 2>, 10> wheel_delay{};
-  unsigned head = 0;
   bool started = false;
   void step(const std::array<double, 24> &s, std::array<double, 14> &r) {
     // time,pitch,gyroY,gyroZ,accelX,accelZ,q[6],qd[6],hipTorque[2],sensorsOK,ready,torqueValid,reset
@@ -99,12 +96,8 @@ struct StandupAdapter {
     r[11] = ff[1];
     r[12] = ff[3];
     for (unsigned side = 0; side < 2; ++side) {
-      r[7 + side] = out.wheels_enabled ? wheel_delay[head][side] : 0.F;
-      wheel_delay[head][side] = out.wheel_cmd_rad_s[side];
+      r[7 + side] = out.wheels_enabled ? out.wheel_cmd_rad_s[side] : 0.F;
     }
-    head = (head + 1) % wheel_delay.size();
-    if (!out.wheels_enabled)
-      wheel_delay = {};
     r[13] = 0.;
     started = true;
   }

@@ -12,6 +12,40 @@
 #define HCR_MAX_FRAME 280
 #define HCR_TARGET_TTL_US 20000u
 enum { HCR_HELLO=1,HCR_HELLO_ACK=2,HCR_TELEMETRY=3,HCR_TARGET=129,HCR_STATUS=130 };
+// Optional 10 Hz diagnostic stream, never an applied ACK or source sample.
+enum { HCR_EXECUTION_DIAG=6, HCR_EXECUTION_DIAG_VERSION=1, HCR_EXECUTION_DIAG_WORDS=24 };
+enum {
+  HCR_DIAG_EPOCH=0,
+  HCR_DIAG_VERSION=1,
+  HCR_DIAG_LOCAL_FAULT=2,
+  HCR_DIAG_MOTOR_ERROR=3,
+  HCR_DIAG_LINK_RX_AGE_US=4,
+  HCR_DIAG_TARGET_RX_AGE_US=5,
+  HCR_DIAG_PENDING_AGE_US=6,
+  HCR_DIAG_PENDING_SEQ=7,
+  HCR_DIAG_SUPERSEDED=8,
+  HCR_DIAG_CYCLE_L_US=9,
+  HCR_DIAG_CYCLE_R_US=10,
+  HCR_DIAG_IO_L_US=11,
+  HCR_DIAG_IO_R_US=12,
+  HCR_DIAG_CYCLE_L_MAX_US=13,
+  HCR_DIAG_CYCLE_R_MAX_US=14,
+  HCR_DIAG_IO_L_MAX_US=15,
+  HCR_DIAG_IO_R_MAX_US=16,
+  HCR_DIAG_ERROR_L=17,
+  HCR_DIAG_ERROR_R=18,
+  HCR_DIAG_STAGE_L=19,
+  HCR_DIAG_STAGE_R=20,
+  HCR_DIAG_FLAGS=21,
+  HCR_DIAG_RX_QUEUE_MAX_US=22,
+  HCR_DIAG_APPLIED_LATENCY_MAX_US=23
+};
+// Disarmed software reference capture; not a motion command or TARGET ACK.
+enum { HCR_ENCODER_HOME=131, HCR_ENCODER_HOME_ACK=5 };
+enum { HCR_HOME_APPLIED=1, HCR_HOME_NOT_OFF=2, HCR_HOME_FEEDBACK=3, HCR_HOME_REFUSED=4 };
+// Request payload: epoch:u32, source_seq:u32 (8B).
+// Reply: epoch:u32, request frame seq:u32, result:u32 (12B).
+
 enum { HCR_IMU_OK=1,HCR_ENCODER_OK=2,HCR_CALIBRATED=4,HCR_ESTOP=8,
        HCR_TORQUE_VALID=16,HCR_TARGET_VALID=32,HCR_DRIVER_FAULT=64 };
 enum { HCR_DISABLED=0,HCR_HOME_PD=1,HCR_RECOVERY=2,HCR_POLICY_PD=3 };
@@ -67,6 +101,11 @@ static inline size_t hcr_telemetry(uint8_t*out,size_t cap,uint32_t seq,uint64_t 
   uint8_t p[128];hcr_put32(p,epoch);hcr_put32(p+4,flags);hcr_put32(p+8,applied_seq);
   for(unsigned i=0;i<29;i++)hcr_putfloat(p+12+4*i,values[i]);
   return hcr_encode(out,cap,HCR_TELEMETRY,seq,stamp,p,128);
+}
+static inline size_t hcr_execution_diagnostics(uint8_t*out,size_t cap,uint32_t seq,uint64_t stamp,const uint32_t values[HCR_EXECUTION_DIAG_WORDS]){
+  uint8_t p[HCR_EXECUTION_DIAG_WORDS*4];
+  for(unsigned i=0;i<HCR_EXECUTION_DIAG_WORDS;i++)hcr_put32(p+4*i,values[i]);
+  return hcr_encode(out,cap,HCR_EXECUTION_DIAG,seq,stamp,p,sizeof p);
 }
 static inline int hcr_target(const HcrFrame*f,HcrTarget*out){
   if(f->type!=HCR_TARGET||f->size!=52)return 0;

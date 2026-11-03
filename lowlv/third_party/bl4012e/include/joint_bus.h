@@ -106,6 +106,10 @@ esp_err_t joint_bus_init(joint_bus_t *bus, uart_port_t uart, gpio_num_t pin, int
 esp_err_t bus_ping(joint_bus_t *bus, jb_format_t fmt, uint8_t id, joint_reply_t *reply);
 esp_err_t bus_write(joint_bus_t *bus, jb_format_t fmt, uint8_t id, uint8_t addr,
                     const uint8_t *data, uint8_t len, joint_reply_t *reply);
+// Wheel response level <2: exact TX echo only, then 120 us settle. This does
+// not confirm application; the HCR caller must verify the written register.
+esp_err_t bus_wheel_write_echo(joint_bus_t *bus, uint8_t id, uint8_t addr,
+                              const uint8_t *data, uint8_t len);
 esp_err_t bus_read(joint_bus_t *bus, jb_format_t fmt, uint8_t id, uint8_t addr, uint8_t len,
                    uint8_t *out, joint_reply_t *reply);
 esp_err_t bus_write_mit(joint_bus_t *bus, uint8_t id, const joint_mit_cmd_t *cmd,

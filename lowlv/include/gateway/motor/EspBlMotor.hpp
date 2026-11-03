@@ -18,6 +18,7 @@ class EspMotorBus final : public MotorBus {
  public:
   bool begin(uart_port_t uart, gpio_num_t data, gpio_num_t unused_rx) noexcept;
   std::uint64_t now() const noexcept override;
+  void setWheelWriteReplies(bool enabled) noexcept override { wheel_write_replies_=enabled; }
   BusError lastError() const noexcept override { return error_; }
   BusTrace trace() const noexcept override { return trace_; }
   BusStats stats() const noexcept override;
@@ -25,7 +26,7 @@ class EspMotorBus final : public MotorBus {
                std::size_t, std::size_t, BusReply&) noexcept override;
  private:
   joint_bus_t bus_{};
-  bool initialized_=false;
+  bool initialized_=false, wheel_write_replies_=true;
   BusError error_=BusError::None;
   BusTrace trace_{};
 };

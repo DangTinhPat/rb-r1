@@ -132,7 +132,8 @@ Test native cần build host trước; test native/ONNX sẽ báo SKIP nếu thi
 nên cần xem cả số test bị bỏ qua khi đánh giá kết quả.
 
 Smoke test tự khởi chạy runtime CPU, tạo các socket tạm và đóng chúng sau khi
-kiểm tra. Không cần MCU hoặc robot. Nó kiểm tra handshake, lệnh local, HOME,
+kiểm tra. Không cần MCU hoặc robot. Thêm `--with-web` để kiểm tra mất/khôi phục HTTP
+trong khi core tiếp tục HOME qua MCU giả. Nó kiểm tra handshake, lệnh local, HOME,
 CRC lỗi, E-stop và RESET; không xác nhận động lực học đứng dậy hoặc cân bằng.
 
 Chạy runtime host thủ công với MCU emulator riêng:
@@ -179,6 +180,14 @@ Runtime kiểm tra chủ sở hữu UART rồi lấy TIOCEXCL; không tự dừn
 ./scripts/service.sh stop
 ```
 
+Web chạy trong process riêng với scheduler thường; HTTP chậm/reload không giữ
+GIL của vòng điều khiển. UI tự kết nối lại phần hiển thị, không tự phát lại lệnh.
+Khi dữ liệu cũ, ARM/RESET bị khóa; DISARM/E-STOP vẫn có thể gửi yêu cầu có token.
+Web hiển thị riêng chẩn đoán thực thi từ ESP khi firmware hỗ trợ: tuổi TARGET,
+tuổi batch và thời gian từng bus motor; dữ liệu cũ được đánh dấu.
+Web RB không có browser-heartbeat để gia hạn motor: watchdog LF–ESP hoạt động
+độc lập. Mất response sau một lệnh được báo chưa xác nhận, không tự gửi lại.
+
 Service wrapper dùng PID `/var/run/rb-runtime.pid`, log `/tmp/rb-runtime.log`.
 Trạng thái mặc định: `/tmp/rb-hybrid-status.json`.
 Mẫu `deploy/S96rbruntime` dùng project tại `/root/rb-r1`; có thể đặt
@@ -191,6 +200,7 @@ Các lệnh local gửi qua `/tmp/rb-hybrid-command.sock`:
 python3 scripts/command.py ARM
 python3 scripts/command.py VELOCITY 0.3 0.0
 python3 scripts/command.py DISARM
+python3 scripts/command.py RESET_ENCODERS
 python3 scripts/command.py ESTOP
 python3 scripts/command.py RESET
 ```
@@ -199,12 +209,23 @@ ARM bắt đầu HOME rồi tự chuyển sang đứng dậy; không có chế �
 Trước ARM cần telemetry mới, IMU/encoder/homing hợp lệ và tư thế gần home.
 HOME feedback: hipL/R = 2,35706715 rad, kneeL/R = 0.
 RESET tạo phiên mới và không tự ARM. DISARM giữ nguyên lỗi đang latch.
+
+Chụp HOME trên web: **Disable → đợi sáu motor OFF → xếp hai chân về HOME bằng
+tay → giữ yên → Reset encoder · Chụp HOME**. ESP chụp zero tại tư thế này,
+không ra lệnh di chuyển. Chờ thông báo ESP đã chụp HOME; motor vẫn Disable,
+ARM là thao tác riêng. Nút này khác RESET phiên/lỗi. Firmware ESP phải hỗ trợ
+`ENCODER_HOME`; firmware cũ sẽ báo chưa xác nhận và không tự thử lại.
+Chụp HOME cần làm sau mỗi boot ESP, không cần làm lại chỉ vì Disable/Enable.
+IMU và zero encoder là hai việc độc lập: Disable/Enable và Reset encoder giữ
+bias IMU. Sau reboot/OTA, IMU tự hiệu chuẩn nếu đủ điều kiện đứng yên; nếu
+không đạt thì cần `CAL_IMU` qua console khi OFF và đứng yên. Reset encoder
+không thay cho IMU hợp lệ trước ARM.
 Lệnh vận tốc trên socket local được giữ tới khi có lệnh mới, DISARM, RESET hoặc lỗi;
 client điều khiển phải chủ động gửi lệnh dừng.
 
 Dashboard mặc định tại `127.0.0.1:8080`; access token nằm ở
 `/tmp/rb-hybrid-web.token`. API status và command cần Bearer token. Dashboard có
-ARM, DISARM, RESET và ESTOP; lệnh vận tốc dùng CLI. Có thể truy cập qua SSH tunnel:
+ARM, Disable, Reset encoder, RESET phiên/lỗi và ESTOP; lệnh vận tốc dùng CLI. Có thể truy cập qua SSH tunnel:
 
 ```bash
 ssh -L 8080:127.0.0.1:8080 root@DIA_CHI_LF

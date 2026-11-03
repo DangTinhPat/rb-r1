@@ -45,6 +45,8 @@ public:
         0.903F; // 120 mm hip-axle (0.640 = 98.2 mm fell: the 15:20 loop limit-cycles below ~104 mm)
     float catch_rise_rate_rad_s = 0.20F;
     float catch_rise_accel_rad_s2 = 1.0F;
+    // Separate braking bound when the rise gate closes; 0 uses the acceleration.
+    float catch_rise_brake_rad_s2 = 0.0F;
     float catch_rise_start_dwell_s = 0.5F;
     float catch_rise_tracking_max_rad = 0.15F;
     float catch_hip_lean_deadband_rad = 0.0F;
@@ -53,6 +55,9 @@ public:
         0.08F; // after the rise, hand off only once this slow (filtered)
     float catch_rise_posture_rate_rad_s = 0.0F;
     float rise_hip_ff = 0.0F;
+    // Compensate the knee motion that actually reached the mechanism.
+    bool rise_hip_ff_measured = false;
+    float rise_hip_ff_filter_s = 0.06F;
     bool post_handoff_rise = false;
     float rise_max_pitch_error_rad = 0.30F;
     float rise_max_pitch_rate_rad_s = 3.0F;
@@ -259,7 +264,8 @@ public:
     float hip_jacobian = 1.0F;
     float hip_measured_rad = 0.0F;
     float hip_measured_rate_rad_s = 0.0F;
-    float knee_measured_rad = 0.0F;              // mean knee encoder (core offset, >= 0)
+    float knee_measured_rate_rad_s = 0.0F;      // mean of both knee rates
+    float knee_measured_rad = 0.0F;             // slower knee encoder (core offset, >= 0)
     std::array<float, 2> wheel_measured_rad_s{}; // native +Y on both sides
     float carrier_rate_rad_s = 0.0F;             // body + hip + knee angular velocity
     float ground_speed_m_s = 0.0F;               // encoders + carrier, assumes rolling support
@@ -437,25 +443,31 @@ public:
     return su;
   }
 
-  [[nodiscard]] static Config tunedRecoveryRb(float wheel_lag_s = 0.075F) noexcept {
-    Config su = tunedRecovery(wheel_lag_s);
+  [[nodiscard]] static Config tunedRecoveryRb(float wheel_lead_s = 0.12F) noexcept {
+    Config su = tunedRecovery(wheel_lead_s);
     su.kneel_hold_s = 0.878F;
     su.slump_travel_rad = 0.18F;
-    su.catch_accel_gain = 10.03F; // just above g: the angle-based loop stiffens as 1/h on RB
-    su.catch_accel_damping = 1.218F;
-    su.catch_hip_gain = 2.74F;
-    su.catch_hip_rate_max_rad_s = 1.449F;
-    su.catch_hip_accel_rad_s2 = su.lift_hip_accel_rad_s2 = 4.32F;
+    su.catch_accel_gain = 8.62F;
+    su.catch_accel_damping = 0.958F;
+    su.catch_hip_gain = 4.0F;
+    su.catch_hip_rate_max_rad_s = 1.528F;
+    su.catch_hip_accel_rad_s2 = su.lift_hip_accel_rad_s2 = 4.5F;
     su.catch_accel_max = 20.0F;
-    su.catch_wheel_max_rad_s = 14.67F;
+    su.catch_wheel_max_rad_s = 11.0F;
     su.catch_blend_s = 0.064F;
-    su.catch_speed_gain = 2.24F;
-    su.catch_speed_integral_gain = 0.4068F;
-    su.catch_hip_lean_deadband_rad = 0.0614F;
-    su.recovery_body_gain = 2.43F;
-    su.recovery_body_rate_max_rad_s = 2.94F;
+    su.catch_speed_gain = 1.72F;
+    su.catch_speed_integral_gain = 0.247F;
+    su.catch_speed_integral_max_rad = 0.119F;
+    su.catch_speed_lean_max_rad = 0.101F;
+    su.catch_speed_filter_s = 0.12F;
+    su.catch_hip_lean_deadband_rad = 0.069F;
+    su.recovery_body_gain = 6.0F;
+    su.recovery_body_rate_max_rad_s = 3.3F;
+    su.catch_wheel_delay_s = 0.0976F;
+    su.catch_wheel_lag_s = 0.038F;
     su.catch_rise_rate_rad_s = 0.7937F;
     su.catch_rise_accel_rad_s2 = 0.7435F;
+    su.catch_rise_brake_rad_s2 = 4.0F;
     su.catch_rise_start_dwell_s = 0.456F;
     su.catch_rise_posture_rate_rad_s = 0.204F;
     su.servo_omega_full_rad_s = 6.5F;
@@ -464,9 +476,9 @@ public:
     // the lift.
     su.lift_assist_rate_rad_s = 0.3259F;
     su.lift_assist_travel_rad = 0.30F;
-    // Hip follows the knee during the rise so the body does not tip back (-11.6 deg -> -2.6 deg in
-    // the nominal run).
-    su.rise_hip_ff = 0.9F;
+    // Match Lumi-Quantum's measured-rate compensation, not commanded knee speed.
+    su.rise_hip_ff = 0.65F;
+    su.rise_hip_ff_measured = true;
     // Measure the body CoM before the catch (RecoveryController applies it when the drives report
     // the hip torque), at two pitches so a CoM height error does not leak into x. In the MuJoCo
     // model the estimate is within 0.1 mm.
@@ -487,6 +499,7 @@ public:
     knee_cmd_ = std::isfinite(knee_rad) ? knee_rad : 0.0F;
     speed_filtered_m_s_ = speed_integral_rad_ = 0.0F;
     hip_rate_cmd_ = wheel_velocity_m_s_ = 0.0F;
+    knee_rate_meas_f_ = 0.0F;
     catch_leveling_ = true;
     catch_stall_s_ = 0.0F;
     body_level_armed_ = body_rate_initialized_ = false;
@@ -886,7 +899,10 @@ public:
         const float rise_rate_target =
             opening ? config_.catch_rise_rate_rad_s * catchBlend() : 0.0F;
         const float rise_accel = config_.catch_rise_accel_rad_s2 * dt;
-        knee_rate_cmd_ += std::clamp(rise_rate_target - knee_rate_cmd_, -rise_accel, rise_accel);
+        const float rise_brake = (config_.catch_rise_brake_rad_s2 > 0.0F
+                                      ? config_.catch_rise_brake_rad_s2
+                                      : config_.catch_rise_accel_rad_s2) * dt;
+        knee_rate_cmd_ += std::clamp(rise_rate_target - knee_rate_cmd_, -rise_brake, rise_accel);
         const float rise_lower =
             std::max(knee_start_rad_, in.knee_measured_rad - config_.catch_rise_tracking_max_rad);
         const float rise_upper =
@@ -897,7 +913,13 @@ public:
           knee_rate_cmd_ = 0.0F; // no windup
         knee_cmd_ = rise_next;
         rise_done_ = knee_cmd_ >= rise_goal - 1.0e-3F;
-        feedback_rate -= config_.rise_hip_ff * knee_rate_cmd_;
+        float ff_knee_rate = knee_rate_cmd_;
+        if (config_.rise_hip_ff_measured) {
+          const float alpha = std::clamp(dt / std::max(config_.rise_hip_ff_filter_s, dt), 0.0F, 1.0F);
+          knee_rate_meas_f_ += alpha * (in.knee_measured_rate_rad_s - knee_rate_meas_f_);
+          ff_knee_rate = knee_rate_meas_f_;
+        }
+        feedback_rate -= config_.rise_hip_ff * ff_knee_rate;
       }
       out.knee_rate_rad_s = knee_rate_cmd_;
       out.hip_feedback_rate_rad_s = feedback_rate;
@@ -1323,6 +1345,11 @@ private:
   }
 
   bool valid(const Input &in) const noexcept {
+    if (config_.catch_rise &&
+        (!std::isfinite(config_.catch_rise_brake_rad_s2) || config_.catch_rise_brake_rad_s2 < 0.0F ||
+         !std::isfinite(config_.rise_hip_ff_filter_s) || config_.rise_hip_ff_filter_s < 0.0F ||
+         (config_.rise_hip_ff_measured && !std::isfinite(in.knee_measured_rate_rad_s))))
+      return false;
     if (config_.catch_rolling_handoff && (!std::isfinite(config_.rolling_handoff_settle_s) ||
                                           config_.rolling_handoff_settle_s < 0.08F))
       return false;
@@ -1528,6 +1555,7 @@ private:
   float rise_calm_s_ = 0.0F;
   bool rise_started_ = false, rise_done_ = false, rise_gates_ok_ = false;
   float lift_s_ = 0.0F, b4_clear_s_ = 0.0F, knee_rate_cmd_ = 0.0F, knee_start_rad_ = 0.0F;
+  float knee_rate_meas_f_ = 0.0F;
   float lift_hip_weight_ = 0.0F;
   float speed_filtered_m_s_ = 0.0F, speed_integral_rad_ = 0.0F;
   bool catch_overlap_ = false, kneel_release_ = false;

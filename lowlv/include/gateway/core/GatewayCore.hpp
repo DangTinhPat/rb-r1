@@ -10,11 +10,18 @@ struct WirePacket {
 enum class LocalFault : std::uint32_t {
   None, TargetTimeout, Sensors, Driver, Estop, Transport, RemoteFault
 };
+// Console-only context, frozen BEFORE stop changes the state/validity flags.
+struct SensorFaultContext {
+  std::uint64_t at_us=0, imu_stamp_us=0, encoder_stamp_us=0;
+  std::uint32_t flags=0;
+  bool motor_ready=false, encoders_valid=false, homed=false;
+};
 struct Diagnostics {
   std::uint32_t epoch = 0, rx_targets = 0, rejected = 0, applied_seq = 0;
   std::uint32_t remote_mode = 0, remote_fault = 0, telemetry_flags = 0;
   LocalFault fault = LocalFault::None;
   bool connected = false, armed = false, enabled = false, motors_ready = false;
+  SensorFaultContext sensor_fault{};
 };
 
 // Owned by one service/motor task. UART is isolated by bounded queues; expiry
@@ -25,6 +32,7 @@ class GatewayCore {
   WirePacket receive(const HcrFrame&, std::uint64_t now,
                      std::uint64_t received_us = 0) noexcept;
   WirePacket telemetry(std::uint64_t now) noexcept;
+  WirePacket executionDiagnostics(std::uint64_t now) noexcept;
   WirePacket requestSession(std::uint64_t now) noexcept;
   // Call only for a telemetry packet actually written by UART, with its
   // original sample timestamp, never for HELLO_ACK packets.
@@ -61,11 +69,13 @@ class GatewayCore {
   std::uint32_t epoch_ = 0, tx_seq_ = 0, rx_seq_ = 0, target_seq_ = 0, applied_seq_ = 0;
   std::uint32_t rx_targets_ = 0, rejected_ = 0, remote_mode_ = 0, remote_fault_ = 0;
   std::uint64_t rx_stamp_ = 0, deadline_ = 0, last_tick_ = 0;
-  std::uint64_t last_rx_us_ = 0;
+  std::uint64_t last_rx_us_ = 0, last_target_rx_us_ = 0;
+  std::uint32_t rx_queue_max_us_ = 0;
   bool connected_ = false, have_rx_ = false, armed_ = false, enabled_ = false;
   bool applied_valid_ = false, reset_pending_ = false;
   bool maintenance_ = false;
   bool disable_ack_pending_ = false;
   LocalFault fault_ = LocalFault::None;
+  SensorFaultContext sensor_fault_{};
 };
 }  // namespace gateway

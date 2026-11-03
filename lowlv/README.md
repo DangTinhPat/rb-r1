@@ -13,7 +13,7 @@ Luckfox (LF)  ──UART0, giao thức HCR1, 921600 baud──►  ESP32-S3  ─
 - Mất liên lạc với LF, lệnh quá hạn hoặc lỗi driver thì ESP tự tắt motor.
 - UART0: chân TX GPIO43, RX GPIO44, nối với UART2 của LF (GPIO1_B2/B3). Console dùng USB native, không dùng UART0.
 - Bus motor trái: UART2 / GPIO15. Bus motor phải: UART1 / GPIO17.
-- **Sau mỗi lần khởi động phải chạy `MOTOR_HOME` trước khi cho phép ARM.**
+- **Sau mỗi lần khởi động phải chụp HOME trước ARM**: `MOTOR_HOME` qua console hoặc nút **Reset encoder · Chụp HOME** trên web LF.
 
 ## Cấu trúc thư mục
 
@@ -47,7 +47,8 @@ Hai thư mục này có cùng bốn nhóm con. Mỗi nhóm có header trong `inc
 | `protocol/` | `hcr_protocol.h` | Mã hóa/giải mã frame HCR1, CRC, parser byte stream. Giống bản phía LF. |
 | `core/` | `GatewayCore` | Máy trạng thái chính: bắt tay, epoch/sequence, telemetry 200 Hz, nhận TARGET, kiểm tra hạn 20 ms, latch lỗi, ARM/DISARM. Không biết gì về phần cứng cụ thể. |
 | `motor/` | `MotorBackend.hpp` | Giao diện trừu tượng giữa `GatewayCore` và motor (nộp lệnh, hỏi kết quả, tắt motor). |
-| | `BlMotor` | Logic motor BL4012: đóng gói lệnh, hai worker (trái/phải), mapping dấu và zero, unwrap encoder, retry có giới hạn, ACK khi cả hai bus đã áp dụng lệnh. |
+| | `hal/` | Codec và mapping lấy từ Lumi-Quantum; không phụ thuộc project nguồn. |
+| | `BlMotor` | Logic motor BL4012: đóng gói lệnh, hai worker (trái/phải), mapping dấu/zero và crank HCR → gối driver, unwrap encoder, retry có giới hạn, ACK khi cả hai bus đã áp dụng lệnh. |
 | | `EspBlMotor` | Phần chạm phần cứng ESP32: UART một dây, task worker. Gọi `joint_bus.c`. |
 | `imu/` | `Mpu6500Spi` | Đọc MPU6500 qua SPI. |
 | | `ImuMount.hpp` | Ánh xạ trục chip sang hệ body (+X trước, +Y trái, +Z lên). |

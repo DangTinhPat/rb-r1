@@ -67,8 +67,13 @@ class HybridCore:
         self.inference_max_ms = 0.0
         self.consecutive_misses = 0
         self.offset_us = None
+        self.mcu_diagnostics = None
+        self.mcu_diagnostics_rx = None
+        self.mcu_diagnostics_offset_us = None
         self.last_telemetry_flags = None
         self.last_command_error = None
+        self.encoder_source = None
+        self.encoder_reset = {"state":"idle", "message":"Chưa chụp HOME trong phiên này"}
 
     def frame(self, kind, payload):
         seq = self.tx_seq
@@ -109,12 +114,18 @@ class HybridCore:
         return frame
 
     def fail(self, name, detail=""):
-        if self.mode != "FAULT":
+        if name != "invalid_telemetry" and self.encoder_reset["state"] == "pending":
+            self.encoder_reset = {"state":"error", "message":"Reset encoder bị hủy vì runtime có lỗi; không tự gửi lại."}
+        # A driver fault/E-stop takes precedence over missing startup
+        # calibration: that startup fault permits a disarmed HOME capture.
+        if self.mode != "FAULT" or name == "driver_fault":
             self.fault, self.reason = FAULTS[name], detail or name
         self.mode = "FAULT"
         return self.output(self.rx_seq or 0)
 
     def watchdog(self, now):
+        if self.encoder_reset["state"] == "pending" and now - self.encoder_reset["sent_at"] > 1.0:
+            self.encoder_reset = {"state":"error", "message":"ESP chưa xác nhận Reset encoder; không tự gửi lại. Kiểm tra firmware/link."}
         if self.mode in ("HOME", "STANDUP", "WARMUP", "MODEL"):
             if (
                 self.last_rx is None
@@ -132,7 +143,7 @@ class HybridCore:
                 return [disabled, self.hello(), self.status()]
             self.counters["rejected"] += 1
             return []
-        if frame.kind not in (p.HELLO_ACK, p.TELEMETRY):
+        if frame.kind not in (p.HELLO_ACK, p.TELEMETRY, p.ENCODER_HOME_ACK, p.EXECUTION_DIAG):
             self.counters["rejected"] += 1
             return []
         if (
@@ -144,8 +155,48 @@ class HybridCore:
         if not p.newer(frame.seq, self.rx_seq):
             self.counters["rejected"] += 1
             return []
+        if frame.kind == p.EXECUTION_DIAG:
+            # Optional measurements share sequence ordering, but cannot renew
+            # telemetry/ACK watchdogs, seed encoder source, or emit TARGET.
+            try:
+                data = p.decode_execution_diagnostics(frame.payload)
+            except (ValueError, struct.error):
+                self.counters["rejected"] += 1
+                return []
+            if not self.link:
+                self.counters["rejected"] += 1
+                return []
+            offset = now * 1e6 - frame.stamp
+            baselines = [offset]
+            if self.mcu_diagnostics_offset_us is not None:
+                baselines.append(self.mcu_diagnostics_offset_us)
+            if self.offset_us is not None:
+                baselines.append(self.offset_us)
+            self.mcu_diagnostics_offset_us = min(baselines)
+            data["transport_age_s"] = max(0.0,
+                (offset - self.mcu_diagnostics_offset_us) / 1e6)
+            self.mcu_diagnostics, self.mcu_diagnostics_rx = data, now
+            self.rx_seq = frame.seq
+            return []
         self.rx_seq = frame.seq
         try:
+            if frame.kind == p.ENCODER_HOME_ACK:
+                _, request_seq, result = p.ENCODER_HOME_ACK_DATA.unpack(frame.payload)
+                if self.encoder_reset["state"] != "pending" or request_seq != self.encoder_reset["request_seq"]:
+                    self.counters["rejected"] += 1
+                    return []
+                if result == p.HOME_APPLIED:
+                    # This button explicitly resets the software reference and LF
+                    # session. MCU local fault latch/HOME remain untouched by epoch.
+                    disabled = self.output(self.rx_seq or 0)
+                    self.new_epoch()
+                    self.encoder_reset = {"state":"done", "message":"ESP đã chụp HOME. Giữ Disable; ARM là thao tác riêng."}
+                    return [disabled, self.hello(), self.status()]
+                messages = {p.HOME_NOT_OFF:"ESP chưa xác nhận đủ 6 motor OFF; bấm Disable và đợi.",
+                            p.HOME_FEEDBACK:"Feedback encoder cũ hoặc thiếu; chưa chụp HOME.",
+                            p.HOME_REFUSED:"ESP từ chối: encoder còn chuyển động, bus/lỗi hoặc chưa OFF."}
+                self.encoder_reset = {"state":"error", "message":messages.get(result,"Kết quả Reset encoder không hợp lệ")}
+                return []
             if frame.kind == p.HELLO_ACK:
                 if p.HELLO_DATA.unpack(frame.payload) != (
                     self.epoch,
@@ -154,6 +205,9 @@ class HybridCore:
                     p.SCHEMA,
                 ):
                     raise ValueError("interface mismatch")
+                offset = now * 1e6 - frame.stamp
+                self.mcu_diagnostics_offset_us = (offset if self.mcu_diagnostics_offset_us is None else
+                    min(offset, self.mcu_diagnostics_offset_us))
                 if not self.link:
                     self.link, self.mode = True, "DISARMED"
                 return [self.status()]
@@ -170,9 +224,23 @@ class HybridCore:
         self.last_command_error = None
         if not math.isfinite(vx) or not math.isfinite(wz):
             raise ValueError("nonfinite command")
-        if op not in ("ARM", "DISARM", "RESET", "VELOCITY"):
+        if op not in ("ARM", "DISARM", "RESET", "VELOCITY", "RESET_ENCODERS"):
             self.counters["rejected"] += 1
             return [self.status()]
+        if op == "RESET_ENCODERS":
+            if (not self.link or self.mode not in ("DISARMED", "FAULT") or
+                (self.mode == "FAULT" and self.fault != FAULTS["invalid_telemetry"]) or
+                self.encoder_reset["state"] == "pending" or self.encoder_source is None or
+                not 0 <= now-self.encoder_source[1] <= .03 or
+                not (self.last_telemetry_flags or 0) & p.ENCODER_OK or
+                (self.last_telemetry_flags or 0) & (p.ESTOP | p.DRIVER_FAULT)):
+                self.counters["rejected"] += 1
+                self.last_command_error = "Reset encoder: Disable trước, cần feedback encoder mới và không có lỗi driver/E-stop."
+                return [self.status()]
+            request = self.frame(p.ENCODER_HOME, p.ENCODER_HOME_DATA.pack(self.epoch,self.encoder_source[0]))
+            self.encoder_reset = {"state":"pending", "request_seq":request.seq, "sent_at":now,
+                                  "message":"Đang chờ ESP xác nhận chụp HOME; không tự bật motor."}
+            return [request]
         if op == "RESET":
             disabled = self.output(self.rx_seq or 0)
             self.new_epoch()
@@ -185,6 +253,10 @@ class HybridCore:
                 self.logic.reset()
             self.velocity = [0.0, 0.0]
             return [self.output(self.rx_seq or 0), self.status()]
+        if op == "ARM" and self.encoder_reset["state"] == "pending":
+            self.counters["rejected"] += 1
+            self.last_command_error = "ARM: đang chờ ESP xác nhận Reset encoder"
+            return [self.status()]
         if op == "ARM" and self.mode == "DISARMED":
             if (
                 self.last_rx is None
@@ -229,6 +301,7 @@ class HybridCore:
     def telemetry(self, frame, now):
         t = p.Telemetry.decode(frame.payload)
         self.last_telemetry_flags = t.flags
+        self.encoder_source = (frame.seq, now)
         if t.flags & (p.ESTOP | p.DRIVER_FAULT):
             return [self.fail("driver_fault"), self.status()]
         if t.flags & 7 != 7:
@@ -340,8 +413,15 @@ class HybridCore:
         self.mode = "WARMUP" if elapsed >= self.config["warmup_start_s"] else "STANDUP"
         return [self.output(frame.seq, p.RECOVERY, flags, self.target, ff)]
 
-    def snapshot(self):
+    def snapshot(self, now=None):
+        now = time.monotonic() if now is None else now
+        diagnostics = None
+        if self.mcu_diagnostics is not None:
+            diagnostics = dict(self.mcu_diagnostics)
+            diagnostics["age_s"] = max(0.0, now - self.mcu_diagnostics_rx)
         return {
+            "mcu_diagnostics": diagnostics,
+            "encoder_reset": self.encoder_reset.copy(),
             "epoch": self.epoch,
             "mode": self.mode,
             "phase": self.phase,

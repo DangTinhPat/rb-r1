@@ -60,3 +60,20 @@ class CodecInterop(unittest.TestCase):
         self.assertEqual(reply[:3], ["123", "7", "3"])
         self.assertAlmostEqual(float(reply[3]), -0.7, places=6)
         self.assertEqual(float(reply[4]), 0.125)
+
+    def test_encoder_home_contract_vectors(self):
+        # Same independent wire vectors are checked by the MCU core tests.
+        expected = bytes.fromhex(
+            'a55a01830800000003000000030000000000000007000000010000006539d111'
+            'a55a01050c00000002000000a186010000000000070000000300000001000000eb8da1a6')
+        request = p.Frame(p.ENCODER_HOME, 3, 3, p.ENCODER_HOME_DATA.pack(7, 1))
+        ack = p.Frame(p.ENCODER_HOME_ACK, 2, 100001, p.ENCODER_HOME_ACK_DATA.pack(7, 3, p.HOME_APPLIED))
+        self.assertEqual(request.encode() + ack.encode(), expected)
+        self.assertEqual(subprocess.check_output([self.binary, 'home']), expected)
+
+    def test_execution_diagnostics_c_python_contract(self):
+        values = [7, 1] + list(range(2, 24))
+        raw = p.Frame(p.EXECUTION_DIAG, 9, 123456, p.EXECUTION_DIAG_DATA.pack(*values)).encode()
+        self.assertEqual(raw.hex(), 'a55a0106600000000900000040e2010000000000070000000100000002000000030000000400000005000000060000000700000008000000090000000a0000000b0000000c0000000d0000000e0000000f00000010000000110000001200000013000000140000001500000016000000170000007d72bbac')
+        self.assertEqual(subprocess.check_output([self.binary, 'diagnostics']), raw)
+        self.assertEqual(p.decode_execution_diagnostics(raw[20:-4])['applied_latency_max_us'], 23)

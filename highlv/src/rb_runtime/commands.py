@@ -13,6 +13,6 @@ def parse_command(data):
         if not math.isfinite(vx) or not math.isfinite(wz):
             raise ValueError("nonfinite velocity")
         return op, vx, wz
-    if op in ("ARM", "DISARM", "RESET", "ESTOP") and len(tokens) == 1:
+    if op in ("ARM", "DISARM", "RESET", "ESTOP", "RESET_ENCODERS") and len(tokens) == 1:
         return op, 0.0, 0.0
-    raise ValueError("use ARM, DISARM, RESET, ESTOP, or VELOCITY vx wz")
+    raise ValueError("use ARM, DISARM, RESET, ESTOP, RESET_ENCODERS, or VELOCITY vx wz")

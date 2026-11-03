@@ -28,19 +28,35 @@
         <div class="stat"><span class="label">Inference lớn nhất</span><span id="latency" class="value">—</span></div>
       </div>
       <div id="reason" class="fault"></div>
+      <p id="view" class="note" role="status">Hiển thị: đang kết nối…</p>
       <p id="arm-blocker" class="note"></p>
     </section>
     <section class="card">
       <p class="section-title">Lệnh vận hành</p>
       <div class="actions">
-        <button class="btn arm" data-command="ARM">ARM · Bắt đầu</button>
-        <button class="btn stop" data-command="DISARM">DISARM · Dừng</button>
-        <button class="btn reset" data-command="RESET">RESET · Khởi tạo lại</button>
+        <button class="btn arm" data-command="ARM" disabled>ARM · Bắt đầu</button>
+        <button class="btn stop" data-command="DISARM">Disable · Tắt motor</button>
+        <button class="btn reset" data-command="RESET" disabled>RESET phiên / lỗi</button>
+        <button class="btn reset" data-command="RESET_ENCODERS" disabled>Reset encoder · Chụp HOME</button>
         <button class="btn estop" data-command="ESTOP">E-STOP · Dừng khẩn cấp</button>
       </div>
+      <p class="note">Disable → đợi motor OFF → xếp hai chân về HOME bằng tay → Reset encoder. Chỉ chụp mốc góc, không làm chân chuyển động hay tự ARM. IMU được giữ nguyên.</p>
+      <p id="encoder-reset" class="note" role="status"></p>
+      <p id="command-result" class="note" role="status"></p>
       <p class="note">ARM chỉ là yêu cầu. LF và ESP32 vẫn kiểm tra liên kết, cảm biến, tư thế home và trạng thái driver. E-STOP qua mạng không thay thế nút dừng cứng.</p>
       <div class="keybox"><input id="token" type="password" autocomplete="off" placeholder="Access token từ LF"><button id="save">Lưu</button></div>
       <p class="note">Token lưu trong trình duyệt này. Lấy token bằng SSH từ file cấu hình web trên LF.</p>
+    </section>
+    <section class="card">
+      <p class="section-title">LF → ESP → Motor</p>
+      <p id="motor-diagnosis" class="note">Chưa có chẩn đoán từ ESP</p>
+      <div class="kv"><span>Tuổi TARGET tại ESP</span><b id="target-age">—</b></div>
+      <div class="kv"><span>Tuổi batch đang chờ</span><b id="batch-age">—</b></div>
+      <div class="kv"><span>Chu kỳ bus L / R</span><b id="bus-cycle">—</b></div>
+      <div class="kv"><span>I/O lớn nhất L / R</span><b id="bus-io">—</b></div>
+      <div class="kv"><span>Lệnh chờ được thay mới</span><b id="superseded">—</b></div>
+      <div class="kv"><span>Hàng đợi RX lớn nhất</span><b id="rx-queue">—</b></div>
+      <p class="note">Số đo độc lập với ACK. Chu kỳ gồm startup/poll và xử lý OFF khi lỗi; I/O là từng giao dịch. Kết quả thực thi vẫn cần cả hai bus.</p>
     </section>
     <section class="card">
       <p class="section-title">Kết nối và sức khỏe</p>
@@ -52,14 +68,194 @@
       <div class="kv"><span>Cập nhật trạng thái</span><b id="age">—</b></div>
     </section>
   </div>
-  <footer>Trang cập nhật trạng thái mỗi giây. Khi runtime offline, nút lệnh bị khóa.</footer>
+  <footer>Trang tự đọc lại trạng thái sau mất kết nối. Dữ liệu cũ khóa ARM/RESET/Reset encoder; DISARM và E-STOP vẫn có thể gửi yêu cầu. Kết nối lại không tự gửi lệnh.</footer>
 </main><div id="toast" class="toast"></div>
 <script>
-const $=id=>document.getElementById(id), tokenKey='rb-hybrid-token', names={WAIT_LINK:'Chờ liên kết',DISARMED:'Đã disarm',HOME:'Giữ tư thế home',STANDUP:'Đứng dậy',WARMUP:'Khởi động model',MODEL:'Model điều khiển',FAULT:'Lỗi',OFFLINE:'Runtime offline'};
-$('token').value=localStorage.getItem(tokenKey)||'';$('save').onclick=()=>{localStorage.setItem(tokenKey,$('token').value.trim());toast('Đã lưu token trong trình duyệt');refresh()};
-function toast(message){const t=$('toast');t.textContent=message;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2600)}
-async function command(command){if(command==='ESTOP'&&!confirm('Gửi yêu cầu E-STOP tới runtime LF?'))return;try{const r=await fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+$('token').value.trim()},body:JSON.stringify({command})});const d=await r.json();toast(d.accepted?`${command}: yêu cầu đã nhận (${names[d.mode]||d.mode})`:d.error||d.fault||`${command} bị từ chối`);await refresh()}catch(e){toast('Không gửi được lệnh: '+e.message)}}
-document.querySelectorAll('[data-command]').forEach(b=>b.onclick=()=>command(b.dataset.command));
-async function refresh(){try{const r=await fetch('/api/status',{headers:{'Authorization':'Bearer '+$('token').value.trim()},cache:'no-store'});if(r.status===401){$('connection').textContent='Cần access token';$('dot').className='dot off';document.querySelectorAll('[data-command]').forEach(b=>b.disabled=true);return}const s=await r.json();const live=!!s.runtime_online;$('dot').className='dot '+(live?'on':'off');$('connection').textContent=live?'Đang trực tuyến':'Runtime không hoạt động';$('mode').textContent=names[s.mode]||s.mode||'Offline';$('transport').textContent=s.transport||'—';$('link').textContent=s.mode==='WAIT_LINK'?'Chưa bắt tay':(s.mode==='OFFLINE'?'—':'Đã bắt tay');$('telemetry').textContent=s.counters?.telemetry_received??s.counters?.telemetry??'—';$('inferences').textContent=s.counters?.inferences??'—';$('phase').textContent=s.phase||'—';$('fault').textContent=s.fault_code??'—';$('latency').textContent=(s.inference_max_ms??0).toFixed?.(2)+' ms';$('reason').textContent=s.reason||'';$('runtime').textContent=live?'Online':'Offline';$('epoch').textContent=s.epoch??'—';$('steps').textContent=s.policy_steps??'—';$('misses').textContent=s.consecutive_deadline_misses??'—';$('parser').textContent=s.parser_errors??'—';$('age').textContent=s.status_age_s===undefined?'—':s.status_age_s.toFixed(1)+' s';const f=s.last_telemetry_flags??0;const blocked=[];if(!live)blocked.push('Runtime offline');else if(s.mode==='FAULT')blocked.push(`ARM bị khóa vì lỗi ${s.fault_code}: ${s.reason||''}`);else if(s.mode!=='DISARMED')blocked.push('ARM chỉ dùng khi DISARMED');if(live&&s.mode==='DISARMED'){if(!s.link)blocked.push('Chưa bắt tay UART');if(!(f&1))blocked.push('IMU chưa hợp lệ');if(!(f&2))blocked.push('Encoder chưa hợp lệ');if(!(f&4))blocked.push('Chưa hiệu chuẩn/HOME');if(f&72)blocked.push('ESP báo lỗi driver hoặc E-stop')}$('arm-blocker').textContent=blocked.join(' · ');document.querySelectorAll('[data-command]').forEach(b=>b.disabled=!live||(b.dataset.command==='ARM'&&blocked.length>0))}catch(e){$('connection').textContent='Không kết nối được';$('dot').className='dot off';document.querySelectorAll('[data-command]').forEach(b=>b.disabled=true)}}
-refresh();setInterval(refresh,1000);
+const $ = id => document.getElementById(id);
+const tokenKey = 'rb-hybrid-token';
+const names = {WAIT_LINK:'Chờ liên kết',DISARMED:'Đã disarm',HOME:'Giữ tư thế home',STANDUP:'Đứng dậy',WARMUP:'Khởi động model',MODEL:'Model điều khiển',FAULT:'Lỗi',OFFLINE:'Runtime offline'};
+let lastStatus = null, viewFresh = false, lastReadAt = 0, revision = 0, failures = 0;
+let pollBusy = false, pollAgain = false, pollController = null, pollTimer = null, paused = false;
+let commandSerial = 0;
+const pendingCommands = new Set();
+try { $('token').value = localStorage.getItem(tokenKey) || ''; } catch (_) {}
+const token = () => $('token').value.trim();
+function toast(message) {
+  const element = $('toast'); element.textContent = message; element.classList.add('show');
+  setTimeout(() => element.classList.remove('show'), 3600);
+}
+const isFresh = () => viewFresh && performance.now() - lastReadAt <= 3500;
+function armBlockers() {
+  const s = lastStatus, blocked = [];
+  if (!isFresh()) return ['Chờ dữ liệu trạng thái mới'];
+  if (!s?.runtime_online) return ['Runtime offline'];
+  if (s.encoder_reset?.state === 'pending') return ['Đang chờ ESP chụp HOME'];
+  if (s.mode === 'FAULT') return [`ARM bị khóa vì lỗi ${s.fault_code}: ${s.reason || ''}`];
+  if (s.mode !== 'DISARMED') return ['ARM chỉ dùng khi DISARMED'];
+  const flags = s.last_telemetry_flags ?? 0;
+  if (!s.link) blocked.push('Chưa bắt tay UART');
+  if (!(flags & 1)) blocked.push('IMU chưa hợp lệ');
+  if (!(flags & 2)) blocked.push('Encoder chưa hợp lệ');
+  if (!(flags & 4)) blocked.push('Chưa hiệu chuẩn/HOME');
+  if (flags & 72) blocked.push('ESP báo lỗi driver hoặc E-stop');
+  return blocked;
+}
+function allowed(command) {
+  if (!token() || pendingCommands.has(command)) return false;
+  // A stale display must not prevent an explicit stop attempt.
+  if (command === 'DISARM' || command === 'ESTOP') return true;
+  if (pendingCommands.size || !isFresh() || !lastStatus?.runtime_online) return false;
+  if (command === 'RESET_ENCODERS') {
+    const s = lastStatus, flags = s.last_telemetry_flags ?? 0;
+    return s.link && (s.mode === 'DISARMED' || (s.mode === 'FAULT' && s.fault_code === 2))
+      && (flags & 2) && !(flags & 72) && s.encoder_reset?.state !== 'pending';
+  }
+  return command !== 'ARM' || armBlockers().length === 0;
+}
+function updateButtons() {
+  document.querySelectorAll('[data-command]').forEach(button => {
+    button.disabled = !allowed(button.dataset.command);
+  });
+  $('arm-blocker').textContent = armBlockers().join(' · ');
+}
+async function request(path, options = {}, controller = new AbortController()) {
+  const timeout = setTimeout(() => controller.abort(), 3000);
+  try {
+    const response = await fetch(path, {...options, signal:controller.signal,
+      headers:{'Authorization':'Bearer ' + token(), ...(options.headers || {})}, cache:'no-store'});
+    const data = await response.json();
+    if (!response.ok) {
+      const error = Error(data?.error || `HTTP ${response.status}`);
+      error.status = response.status; throw error;
+    }
+    if (!data || typeof data !== 'object' || Array.isArray(data)) throw Error('Phản hồi không hợp lệ');
+    return data;
+  } finally { clearTimeout(timeout); }
+}
+function schedulePoll(delay = 1000) {
+  clearTimeout(pollTimer);
+  if (!paused && token()) pollTimer = setTimeout(refresh, delay);
+}
+function invalidateView() {
+  revision++; viewFresh = false; updateButtons();
+  renderMotorDiagnostics({...lastStatus, runtime_online:false});
+  if (pollController) pollController.abort();
+}
+function renderMotorDiagnostics(status) {
+  const d = status.mcu_diagnostics;
+  const fields = ['target-age','batch-age','bus-cycle','bus-io','superseded','rx-queue'];
+  const age = d ? Number(d.age_s) + Number(status.status_age_s || 0) + Number(d.transport_age_s || 0) : Infinity;
+  if (!d || d.transport_age_s == null || !Number.isFinite(age) || age > 1.5 || !status.runtime_online) {
+    $('motor-diagnosis').textContent = d ? 'Chẩn đoán ESP đã cũ; chưa kết luận nguyên nhân hiện tại' : 'Chưa có chẩn đoán từ ESP';
+    fields.forEach(id => $(id).textContent = '—'); return;
+  }
+  const ms = us => us === 4294967295 ? 'chưa nhận' : (Number(us) / 1000).toFixed(2) + ' ms';
+  const faults = ['Không có lỗi cục bộ','ESP hết hạn chờ TARGET từ LF','Cảm biến chưa hợp lệ','Lỗi thực thi motor','E-stop','Mất liên lạc LF–ESP','LF yêu cầu dừng do lỗi'];
+  const motorErrors = ['không lỗi','bus','trạng thái driver','cấu hình','ngoài giới hạn','quá hạn thực thi','feedback','đã hủy','khởi động'];
+  const stages = ['—','bus chưa sẵn sàng','gói lệnh sai','lỗi TX','timeout echo','echo sai','timeout phản hồi','frame phản hồi sai','readback sai','deadline','đã hủy','bus chưa yên','chỉ có echo ghi'];
+  const expiry = (d.flags & 0x500 ? ' · worker vượt hạn TARGET đã nhận' : '') +
+    (d.flags & 0xa00 ? ' · batch motor vượt deadline gốc' : '');
+  $('motor-diagnosis').textContent = (faults[d.local_fault] || 'Lỗi ESP ' + d.local_fault) +
+    (d.motor_error ? ' · Motor: ' + (motorErrors[d.motor_error] || d.motor_error) : '') +
+    expiry + ' · L: ' + (motorErrors[d.error_l] || d.error_l) + ' / R: ' + (motorErrors[d.error_r] || d.error_r) +
+    ' · giao dịch L/R: ' + (stages[d.stage_l] || d.stage_l) + ' / ' + (stages[d.stage_r] || d.stage_r);
+  $('target-age').textContent = ms(d.target_rx_age_us);
+  const supported = (d.flags >>> 31) === 1;
+  $('batch-age').textContent = supported ? ((d.flags & 4) ? ms(d.pending_age_us) : 'không có') : 'không hỗ trợ';
+  $('bus-cycle').textContent = supported ? ms(d.cycle_l_us) + ' / ' + ms(d.cycle_r_us) : 'không hỗ trợ';
+  $('bus-io').textContent = supported ? ms(d.io_l_max_us) + ' / ' + ms(d.io_r_max_us) : 'không hỗ trợ';
+  $('superseded').textContent = supported ? d.superseded : '—';
+  $('rx-queue').textContent = ms(d.rx_queue_max_us);
+}
+function render(status) {
+  const live = status.runtime_online === true;
+  $('dot').className = 'dot ' + (live ? 'on' : 'off');
+  $('connection').textContent = live ? 'Web đã kết nối · runtime online' : 'Web đã kết nối · runtime offline';
+  $('view').textContent = 'Hiển thị: dữ liệu mới';
+  $('mode').textContent = names[status.mode] || status.mode || 'Offline';
+  $('transport').textContent = status.transport || '—';
+  $('link').textContent = status.link ? 'Đã bắt tay' : 'Chưa bắt tay';
+  $('telemetry').textContent = status.counters?.telemetry_received ?? status.counters?.telemetry ?? '—';
+  $('inferences').textContent = status.counters?.inferences ?? '—';
+  $('phase').textContent = status.phase || '—';
+  $('fault').textContent = status.fault_code ?? '—';
+  $('latency').textContent = Number(status.inference_max_ms ?? 0).toFixed(2) + ' ms';
+  $('reason').textContent = status.reason || '';
+  renderMotorDiagnostics(status);
+  $('encoder-reset').textContent = status.encoder_reset?.message || 'Chưa chụp HOME trong phiên này';
+  $('runtime').textContent = live ? 'Online' : 'Offline';
+  $('epoch').textContent = status.epoch ?? '—';
+  $('steps').textContent = status.policy_steps ?? '—';
+  $('misses').textContent = status.consecutive_deadline_misses ?? '—';
+  $('parser').textContent = status.parser_errors ?? '—';
+  $('age').textContent = status.status_age_s === undefined ? '—' : Number(status.status_age_s).toFixed(1) + ' s';
+  updateButtons();
+}
+async function refresh() {
+  if (paused) return;
+  if (pollBusy) { pollAgain = true; return; }
+  clearTimeout(pollTimer);
+  if (!token()) {
+    viewFresh = false; $('connection').textContent = 'Cần access token';
+    $('dot').className = 'dot off'; updateButtons(); return;
+  }
+  pollBusy = true; pollAgain = false;
+  const version = revision, controller = new AbortController(); pollController = controller;
+  try {
+    const status = await request('/api/status', {}, controller);
+    if (version !== revision || paused) return;
+    if (typeof status.runtime_online !== 'boolean') throw Error('Thiếu trạng thái runtime');
+    lastStatus = status; viewFresh = true; lastReadAt = performance.now(); failures = 0; render(status);
+  } catch (error) {
+    if (version !== revision || paused) return;
+    viewFresh = false; failures++;
+    renderMotorDiagnostics({...lastStatus, runtime_online:false});
+    $('dot').className = 'dot off';
+    $('connection').textContent = error.status === 401 ? 'Cần access token hợp lệ' : 'Web đang kết nối lại…';
+    $('view').textContent = 'Hiển thị: dữ liệu cũ · chưa xác minh được trạng thái hiện tại';
+    $('runtime').textContent = lastStatus ? 'Dữ liệu cũ' : 'Chưa có dữ liệu';
+    $('age').textContent = 'Dữ liệu cũ'; updateButtons();
+  } finally {
+    pollBusy = false; pollController = null;
+    schedulePoll(pollAgain ? 0 : Math.min(5000, 1000 * 2 ** Math.min(failures, 3)));
+  }
+}
+async function command(operation) {
+  if (!allowed(operation)) return;
+  if (operation === 'ESTOP' && !confirm('Gửi yêu cầu E-STOP tới runtime LF?')) return;
+  const serial = ++commandSerial;
+  pendingCommands.add(operation); invalidateView();
+  $('command-result').textContent = `${operation}: đang chờ xác nhận…`;
+  try {
+    const result = await request('/api/command', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body:JSON.stringify({command:operation})});
+    if (typeof result.accepted !== 'boolean') throw Error('Thiếu xác nhận lệnh');
+    if (serial === commandSerial) {
+      const message = result.accepted ? (operation === 'RESET_ENCODERS' ? 'Đã gửi yêu cầu chụp HOME; chờ ESP xác nhận bên trái.' : `${operation}: runtime đã nhận (${names[result.mode] || result.mode})`)
+        : result.error || result.fault || `${operation} bị từ chối`;
+      $('command-result').textContent = message; toast(message);
+    }
+  } catch (error) {
+    if (serial === commandSerial) {
+      const message = [400,401].includes(error.status) ? `${operation} bị từ chối: ${error.message}`
+        : `${operation}: chưa xác nhận được kết quả. Kiểm tra trạng thái sau kết nối lại; lệnh không được tự gửi lại.`;
+      $('command-result').textContent = message; toast(message);
+    }
+  } finally {
+    pendingCommands.delete(operation); invalidateView(); refresh();
+  }
+}
+document.querySelectorAll('[data-command]').forEach(button => {
+  button.onclick = () => command(button.dataset.command);
+});
+$('save').onclick = () => {
+  try { localStorage.setItem(tokenKey, token()); toast('Đã lưu token trong trình duyệt'); }
+  catch (_) { toast('Token chỉ dùng trong phiên này'); }
+  invalidateView(); refresh();
+};
+window.addEventListener('online', () => { invalidateView(); refresh(); });
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { invalidateView(); refresh(); } });
+window.addEventListener('pagehide', () => { paused = true; clearTimeout(pollTimer); invalidateView(); });
+window.addEventListener('pageshow', () => { paused = false; refresh(); });
+updateButtons(); refresh();
 </script></body></html>

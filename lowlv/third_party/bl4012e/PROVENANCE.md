@@ -40,8 +40,8 @@ Review local changes with `diff -u upstream/joint_bus.c src/joint_bus.c` and the
 corresponding header diff. From the repository root run:
 
 ```sh
-python3 tests/check_inherited_bus.py
-python3 tests/check_bl_motor.py
+python3 lowlv/tests/check_inherited_bus.py
+python3 lowlv/tests/check_bl_motor.py
 ```
 
 Host fixtures derive from BL4012e's original SDK mock. They compare SDK call
@@ -49,3 +49,32 @@ traces on the covered common unguarded paths, test the actual C++ adapter + C
 module with deadline/cancellation, late/noisy replies and corrupted frames, and
 use negative controls for omitted TX drive and falsely declaring a busy bus quiet.
 They do not prove electrical timing or mechanical performance.
+
+## Lumi wheel response-level adaptation — 2026-11-02
+
+`bus_wheel_write_echo()` adds a unicast wheel-only path for response level<2,
+adapted from Lumi-Quantum `Esp32Bus.cpp` at
+`7b86053c89620484a3c99e869cce3c23dd39d37f`. It reuses guarded exchange with
+no expected reply: validate the complete echo, wait120us, recheck the unchanged
+deadline/cancellation, then return transport success. This is not an applied ACK;
+EspMotorBus returns WriteEchoOnly and the HCR worker must read back the requested
+speed/enable register. Echo/CRC/TX/deadline faults cannot use that path as success.
+Existing public calls retain their reply behavior and common SDK traces. The
+verified upstream snapshot is unchanged. SDK mocks cover echo loss/corruption,
+no9ms write wait, and deadline/cancellation during settle.
+
+
+## Guarded sub-tick receive window — 2026-11-02
+
+The guarded reader previously converted remaining microseconds to whole RTOS
+ticks and returned DEADLINE when fewer than one tick remained, even if the
+complete echo/reply was already buffered and the absolute deadline had not
+expired. The SDK regression reproduces a valid MIT exchange with 800 us left:
+it failed before the change and now succeeds before the original deadline.
+For this final fraction of a tick only, receive uses nonblocking reads with
+10 us polling and the existing deadline/cancellation guard. Unguarded SDK
+traces and normal tick-based waits are unchanged. Missing bytes still reach
+the original deadline, cancellation still aborts, and replies/checksums remain
+validated. No TTL, source-age, applied ACK or fault latch is relaxed.
+This fixes a host-reproduced defect; it has not yet been verified under active
+motor load on the board.

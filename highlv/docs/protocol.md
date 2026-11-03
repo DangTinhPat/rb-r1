@@ -35,8 +35,11 @@ Frame replay/cũ/sai epoch không làm mới watchdog. Timestamp TELEMETRY là l
 | `0x01` | HELLO | LF → MCU; MCU có thể yêu cầu phiên mới |
 | `0x02` | HELLO_ACK | MCU → LF |
 | `0x03` | TELEMETRY | MCU → LF |
+| `0x05` | ENCODER_HOME_ACK | MCU → LF |
+| `0x06` | EXECUTION_DIAG (tùy chọn) | MCU → LF |
 | `0x81` | TARGET | LF → MCU |
 | `0x82` | STATUS | LF → MCU |
+| `0x83` | ENCODER_HOME | LF → MCU |
 
 ARM/DISARM/RESET/ESTOP/VELOCITY là lệnh qua command socket local của runtime,
 không có message CONTROL trong HCR1 hiện tại.
@@ -108,6 +111,12 @@ Không có torque command. Với driver điều khiển crank, gửi `phi_ref` s
 không gửi `phi_ref − hip_ref` thay cho crank target. Hiệu đó chỉ là knee hinge reference.
 Feedforward là hip/knee hinge velocity; crank FF = hip FF + knee FF.
 
+Adapter HAL Lumi hiện dùng encoder ID3 đo knee trực tiếp (`coupling=0`): MCU đổi
+`driver_ref=phi_ref-hip_ref`, `driver_ff=knee_ff`, và phản hồi knee trực tiếp sau
+sign/zero. `applied_target[2:4]` vẫn là crank ảo `hip_quantized+knee_quantized`.
+Nếu driver đo crank (`coupling=1`) thì dùng phi/phi_dot trực tiếp như mô tả trên.
+Đây là chi tiết HAL, không đổi layout hoặc ý nghĩa HCR1.
+
 | Profile | Ý nghĩa |
 |---:|---|
 | 0 DISABLED | Bỏ enable; payload 0 không yêu cầu chạy motor về góc 0 |
@@ -120,8 +129,9 @@ hợp lệ và source sample đã phát còn mới <=30 ms. TTL TARGET **20 ms**
 Frame replay/cũ hoặc STATUS không gia hạn TTL. Watchdog motor phải chạy độc lập
 với task UART và LF. Lỗi/timeout không tự re-enable khi có gói mới.
 
-Recovery helper đã có wheel delay 50 ms. Filter reference recovery tau=0,075 s
-thuộc tầng áp dụng phía dưới; applied_target phải phản ánh reference sau filter.
+Recovery helper hiện không có FIFO wheel delay50ms (đã bỏ khi đồng bộ Lumi).
+Filter reference recovery tau=0,075s thuộc tầng áp dụng phía dưới;
+applied_target phải phản ánh reference sau filter.
 Đáp ứng/gain driver thật cần kiểm riêng, không suy ra từ payload HCR1.
 
 ## 5. STATUS và deadline
@@ -149,6 +159,36 @@ Inference >10 ms: bỏ prediction, giữ reference trước, hidden vẫn cập 
 Inference >15 ms hoặc 3 lần trễ liên tiếp: FAULT. Không handoff bằng prediction muộn.
 Thông tin chi tiết, latency và counter được ghi thêm vào status JSON của LF.
 
+
+### Chụp HOME khi Disable: ENCODER_HOME (0x83), ENCODER_HOME_ACK (0x05)
+
+Nút web **Reset encoder · Chụp HOME** / lệnh local `RESET_ENCODERS` gửi đúng
+một request LF → ESP. Đây là chụp mốc phần mềm như `MOTOR_HOME`, không reset
+bộ đếm phần cứng hoặc di chuyển motor. HOME model: hipL/R=2.35706715 rad,
+kneeL/R=0; mốc bánh tại vị trí hiện tại đặt về 0. Mốc chỉ giữ trong RAM MCU.
+
+- Request 8 byte `<II>`: `epoch:u32, source_seq:u32` (TELEMETRY đã phát ≤30 ms).
+- Reply ESP → LF 12 byte `<III>`: `epoch:u32, request_seq:u32, result:u32`.
+  `request_seq` là sequence frame request, không phải sequence TARGET.
+- Result: `1 HOME_APPLIED` đã chụp; `2 HOME_NOT_OFF` chưa Disable/verified OFF;
+  `3 HOME_FEEDBACK` source cũ/không tồn tại; `4 HOME_REFUSED` lỗi hoặc backend
+  từ chối (feedback cũ, encoder còn quay, chưa cấu hình…).
+
+Cả hai chiều dùng CRC/epoch/sequence chung của HCR1. MCU chỉ chụp khi không
+armed/enabled, LF không ở HOME/STANDUP/WARMUP/MODEL, cả sáu driver đã xác nhận
+OFF, encoder mới và mọi tốc độ tuyệt đối ≤0.15 rad/s. IMU chưa calibrated
+không ngăn chụp encoder. E-stop/lỗi driver cục bộ, timeout hoặc lỗi transport
+đang latch vẫn ngăn chụp. LF FAULT khác mã 2 bị từ chối; maintenance bỏ request
+không trả reply. RemoteFault do LF thiếu calibration không bị xóa
+bởi thao tác capture; chỉ được xử lý qua phiên mới sau xác nhận.
+
+Reply này không phải applied TARGET ACK, không đặt TARGET_VALID và không gia
+hạn TTL 20 ms. Capture không bật motor, không xóa fault latch và không đổi IMU.
+Sau reply thành công, LF gửi disabled, tạo epoch mới rồi bắt tay về DISARMED;
+không tự ARM. LF chỉ nhận reply khớp epoch/request đang chờ. Sau 1 s chưa có
+reply, UI báo chưa xác nhận; không tự gửi lại khi timeout hoặc reconnect.
+Firmware cũ không hỗ trợ request sẽ hết thời gian chờ; phải cập nhật cả hai tầng.
+
 ## 6. Codec đối chiếu và firmware thật
 
 `protocol/include/hcr_protocol.h` phục vụ interop C/Python.
@@ -157,5 +197,71 @@ không chứa đầy đủ state machine, sensor freshness, source history và m
 của firmware MCU. Không dùng fixture thay firmware thật.
 
 Mapping bus được ghi nhận ở firmware riêng: trái UART2/GPIO15, phải UART1/GPIO17;
-wheel ID1, hip ID2, crank ID3. Homing thủ công và xác nhận applied/OFF hai bus
+wheel ID1, hip ID2, gối ID3 (HAL đổi từ crank HCR). Homing thủ công và xác nhận applied/OFF hai bus
 thuộc trách nhiệm firmware MCU. Project runtime không cấu hình bus motor.
+
+
+## Chẩn đoán thực thi tùy chọn: EXECUTION_DIAG (0x06)
+
+MCU → LF, tối đa 10 Hz, payload **96 byte `<24I>`**, mọi trường uint32 LE.
+Frame 120 byte dùng chung sequence MCU→LF, epoch và CRC hiện tại; không đổi
+TARGET, TELEMETRY, TTL 20 ms hoặc source age 30 ms. Firmware/runtime cũ có thể
+bỏ qua type này. Không dùng sequence chẩn đoán làm source TARGET/HOME.
+
+| Word index (offset = index × 4) | Trường |
+|---|---|
+| 0 | `epoch` |
+| 1 | `version = 1` |
+| 2 | `local_fault` |
+| 3 | `motor_error` |
+| 4 | `link_rx_age_us` |
+| 5 | `target_rx_age_us` |
+| 6 | `pending_age_us` |
+| 7 | `pending_seq` |
+| 8 | `superseded` |
+| 9, 10 | `cycle_l_us, cycle_r_us` |
+| 11, 12 | `io_l_us, io_r_us` |
+| 13, 14 | `cycle_l_max_us, cycle_r_max_us` |
+| 15, 16 | `io_l_max_us, io_r_max_us` |
+| 17, 18 | `error_l, error_r` |
+| 19, 20 | `stage_l, stage_r` |
+| 21 | `flags` |
+| 22 | `rx_queue_max_us` |
+| 23 | `applied_latency_max_us` |
+
+`link_rx_age_us` tính từ frame LF hợp lệ được service chấp nhận gần nhất;
+`target_rx_age_us` từ lúc UART nhận TARGET hợp lệ gần nhất, kể cả DISABLED.
+STATUS không làm mới tuổi TARGET. Tuổi chưa biết hoặc tràn uint32 là
+`0xffffffff`; tuổi queue bao gồm cả frame bị loại vì chờ quá lâu.
+
+`flags`: bit0/bit1 = worker trái/phải đã claim batch; bit2 = đang có batch chờ;
+bit8/bit10 = lease TARGET đã hết hạn lúc worker L/R latch lỗi;
+bit9/bit11 = batch đang chạy đã quá deadline gốc lúc worker L/R latch lỗi;
+bit31 = backend hỗ trợ số đo. Các bit còn lại bằng 0. `pending_seq` có thể bằng 0 hợp lệ;
+chỉ đọc tuổi/seq khi bit2 đặt. Không có backend thì nhóm số đo motor bằng 0,
+bit31 clear; không diễn giải thành bus hoạt động tốt.
+
+Chu kỳ và I/O là microsecond. Chu kỳ gồm startup/poll/batch và cả OFF khi lỗi;
+I/O là một giao dịch bus. Max chu kỳ/I/O tính từ lượt active gần nhất, được giữ
+sau OFF. `superseded` và max completion latency tích lũy từ boot/reset backend.
+Completion latency tính từ tạo batch tới service công nhận cả hai bus hoàn tất,
+không phải thời gian trục cơ khí đi tới đích. RX queue max đặt lại khi đổi epoch.
+
+`local_fault`: 0 none, 1 TARGET timeout, 2 sensors, 3 driver/backend, 4 E-stop,
+5 transport, 6 LF remote fault. `motor_error`, `error_l/r`: 0 none, 1 bus,
+2 driver status, 3 configuration, 4 range, 5 expired, 6 feedback, 7 cancelled,
+8 startup. `stage_l/r` giữ BusError tại thời điểm worker latch lỗi: 0 none,
+1 unavailable, 2 packet, 3 TX, 4 echo timeout, 5 echo mismatch, 6 reply timeout,
+7 invalid reply, 8 readback mismatch, 9 deadline, 10 cancelled, 11 quiet,
+12 write echo only. Stage=0 không tự chứng minh bus tốt; đối chiếu error/local fault.
+
+MCU bỏ qua lượt chẩn đoán nếu queue TX thiếu chỗ, không gia hạn deadline và
+không tạo fault chỉ vì bỏ một frame chẩn đoán chưa truyền. UART chỉ đăng ký
+TELEMETRY đã truyền vào source history. LF lưu chẩn đoán riêng; không cập nhật
+telemetry/ACK watchdog, timestamp sample, encoder source hoặc sinh TARGET.
+Payload sai kích thước/version/epoch hoặc replay bị bỏ, không làm FAULT điều khiển.
+Web đánh dấu dữ liệu cũ khi tuổi nhận + tuổi status + độ trễ vận chuyển vượt
+1,5 s, hoặc runtime offline. Mốc đồng hồ chẩn đoán lấy riêng từ HELLO_ACK/
+chẩn đoán và TELEMETRY nếu có; không sửa đồng hồ điều khiển. Chẩn đoán vẫn
+hiện khi IMU/HOME chưa hợp lệ; không dùng số đo cũ để kết luận lỗi.
+Đây là số đo hỗ trợ tìm nguyên nhân, không thay cho fault latch hoặc applied ACK.

@@ -1,17 +1,15 @@
 #include "gateway/motor/BlMotor.hpp"
+#include "gateway/motor/hal/MotorFrameCodec.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <limits>
 
 namespace gateway {
+namespace frame = hal::motor_frame;
 namespace {
-constexpr float pi = 3.14159265358979323846F;
-constexpr float count_rad = 2*pi/16384.F, rpm_rad = 2*pi/60.F;
-std::uint8_t checksum(const std::uint8_t* p, std::size_t n) {
-  std::uint8_t sum = 0; for (std::size_t i=0;i<n;++i) sum += p[i];
-  return static_cast<std::uint8_t>(~sum);
-}
+constexpr float pi = frame::kTwoPi/2;
+constexpr float count_rad = frame::countsToRad(1.F), rpm_rad = frame::kTwoPi/60.F;
 std::uint16_t u16(const std::uint8_t* p) { return p[0] | (std::uint16_t(p[1])<<8); }
 void put(std::uint8_t* p, std::int32_t v) { p[0]=v&255; p[1]=(v>>8)&255; }
 bool fresh(std::uint64_t stamp, std::uint64_t now, std::uint64_t age) {
@@ -26,23 +24,33 @@ bool quantize(float v, std::int32_t lo, std::int32_t hi, std::int32_t& out) {
 std::size_t motorPacket(std::uint8_t id, std::uint8_t instruction,
                         const std::uint8_t* params, std::size_t count,
                         std::array<std::uint8_t,48>& out) noexcept {
-  if (!id || id>=0xfe || count+6>out.size() || (count && !params)) return 0;
-  out[0]=out[1]=0xff; out[2]=id; out[3]=count+2; out[4]=instruction;
-  if (count) std::memcpy(out.data()+5,params,count);
-  out[count+5]=checksum(out.data()+2,count+3); return count+6;
+  if (!id || id>=0xfe || count>18 || (count && !params)) return 0;
+  const auto packet=frame::detail::buildFrame(id,instruction,params,count);
+  std::copy_n(packet.bytes.begin(),packet.len,out.begin());
+  return packet.len;
 }
 bool motorReply(BusFormat fmt, std::uint8_t id, std::uint8_t instruction,
                  std::uint8_t address, std::uint8_t request_length,
                  const std::uint8_t* b, std::size_t count,
                  std::size_t read_count, BusReply& reply) noexcept {
   const unsigned echo=fmt==BusFormat::Wheel?5:7;
-  if (!b || read_count>reply.data.size() || count!=echo+4+read_count ||
-      b[0]!=0xff || b[1]!=0xff || b[2]!=id || b[3]!=count-4 ||
-      b[count-1]!=checksum(b+2,count-3) || b[echo]!=request_length ||
+  if ((fmt!=BusFormat::Joint && fmt!=BusFormat::Wheel) || !b ||
+      read_count>reply.data.size() || count!=echo+4+read_count ||
+      b[2]!=id || b[echo]!=request_length ||
       b[echo+1]!=instruction || b[echo+2]!=address) return false;
-  reply={}; reply.status=b[4];
-  if (fmt==BusFormat::Joint) reply.position=static_cast<std::int16_t>(u16(b+5));
-  if (read_count) std::memcpy(reply.data.data(),b+echo+3,read_count);
+  BusReply decoded{};
+  if (fmt==BusFormat::Joint) {
+    const auto parsed=frame::parseJointReply(b,count);
+    if (!parsed.ok || parsed.data_len!=read_count) return false;
+    decoded.status=parsed.status; decoded.position=parsed.pos;
+    std::copy_n(parsed.data.begin(),read_count,decoded.data.begin());
+  } else {
+    const auto parsed=frame::parseDxlResponse(b,count);
+    if (!parsed.ok || parsed.payload_len!=read_count) return false;
+    decoded.status=parsed.err;
+    std::copy_n(parsed.payload.begin(),read_count,decoded.data.begin());
+  }
+  reply=decoded;
   return true;
 }
 
@@ -52,10 +60,11 @@ bool validMotorConfig(const BlMotorConfig& c) noexcept {
     if (!c.id[i] || c.id[i]>=0xfe) return false;
     for (unsigned j=0;j<i;++j) if (c.id[i]==c.id[j]) return false;
   }
-  for (const auto& g:c.profile)
+  for (const auto* profiles:{&c.profile,&c.knee_profile}) for (const auto& g:*profiles)
     if (!std::isfinite(g.kp) || !std::isfinite(g.kd) || g.kp<0 || g.kd<0 ||
         g.kp>65.535F || g.kd>65.535F) return false;
-  return std::isfinite(c.wheel_max_rpm) && c.wheel_max_rpm>0 &&
+  return (c.knee_crank_coupling==0.F || c.knee_crank_coupling==1.F) &&
+    std::isfinite(c.wheel_max_rpm) && c.wheel_max_rpm>0 &&
     c.feedback_age_us>0 && c.feedback_age_us<=20000 &&
     c.wheel_max_rpm*c.feedback_age_us/60000000.F<.5F &&
     std::isfinite(c.recovery_wheel_tau_s) && c.recovery_wheel_tau_s>=0 &&
@@ -97,17 +106,20 @@ bool BlMotorBackend::disabled() const noexcept {
 MotorFeedback BlMotorBackend::feedback(std::uint64_t now) noexcept {
   MotorGuard guard(lock_);
   MotorFeedback f{}; f.driver_fault=error_!=MotorError::None;
+  // Retain the oldest real sample stamp for fault diagnostics even when stale.
+  // It does not grant validity: all six samples still pass sensorsFresh below.
+  f.stamp_us=state_[0].stamp[0];
+  for (const auto& leg:state_) for (auto stamp:leg.stamp)
+    f.stamp_us=std::min(f.stamp_us,stamp);
   f.encoders_valid=sensorsFresh(now); f.homed=homed_ && f.encoders_valid;
   if (!f.encoders_valid) return f;
-  f.stamp_us=now;
   for (unsigned s=0;s<2;++s) {
     const auto& m=state_[s]; const auto& sign=config_.sign[s];
     const float hip=sign[0]*m.raw_q[0]+zero_[s][0];
-    const float phi=sign[1]*m.raw_q[1]+zero_[s][1];
-    f.q[s]=hip; f.q[2+s]=phi-hip; f.q[4+s]=sign[2]*m.raw_q[2]+zero_[s][2];
+    const float d=sign[1]*m.raw_q[1]+zero_[s][1];
+    f.q[s]=hip; f.q[2+s]=d-config_.knee_crank_coupling*hip; f.q[4+s]=sign[2]*m.raw_q[2]+zero_[s][2];
     f.qd[s]=sign[0]*m.raw_qd[0];
-    f.qd[2+s]=sign[1]*m.raw_qd[1]-f.qd[s]; f.qd[4+s]=sign[2]*m.raw_qd[2];
-    for (auto t:m.stamp) f.stamp_us=std::min(f.stamp_us,t);
+    f.qd[2+s]=sign[1]*m.raw_qd[1]-config_.knee_crank_coupling*f.qd[s]; f.qd[4+s]=sign[2]*m.raw_qd[2];
   }
   return f; // no current-based torque sensor: TORQUE_VALID stays clear
 }
@@ -116,6 +128,7 @@ void BlMotorBackend::cancel() noexcept {
     for (auto& r:request_) { r.active=false; r.batch={}; ++r.generation; }
   }
   in_flight_=have_complete_=have_latest_=false; applied_at_=0;
+  batch_started_={};
 }
 void BlMotorBackend::disable() noexcept { MotorGuard guard(lock_); cancel(); }
 void BlMotorBackend::emergencyStop() noexcept {
@@ -135,6 +148,7 @@ bool BlMotorBackend::resetFault() noexcept {
   if (!validMotorConfig(config_)) return false;
   if (error_==MotorError::None) return true; // LF RESET must not erase a good manual home
   error_=MotorError::None; homed_=false;
+  superseded_=applied_latency_max_us_=0;
   for (auto& r:request_) { ++r.reset_generation; ++r.generation; r.off_test_requested=0; }
   state_={}; return true; // workers must force OFF and reconfigure before ready
 }
@@ -150,8 +164,48 @@ void BlMotorBackend::publish(unsigned side, const MotorLegState& s) noexcept {
   MotorGuard guard(lock_);
   if (s.reset_generation==request_[side].reset_generation) state_[side]=s;
 }
+void BlMotorBackend::publishSample(unsigned side, unsigned motor, const MotorLegState& s) noexcept {
+  MotorGuard guard(lock_);
+  if (side>=2 || motor>=3 || s.error!=MotorError::None ||
+      s.reset_generation!=request_[side].reset_generation ||
+      s.generation!=request_[side].generation) return;
+  auto& shared=state_[side];
+  shared.stamp[motor]=s.stamp[motor];
+  shared.raw_q[motor]=s.raw_q[motor];
+  shared.raw_qd[motor]=s.raw_qd[motor];
+}
 BlMotorDiagnostics BlMotorBackend::diagnostics() const noexcept {
   MotorGuard guard(lock_); return {homed_,request_[0].active,in_flight_,error_,state_};
+}
+MotorExecutionStats BlMotorBackend::executionStats(std::uint64_t now) const noexcept {
+  MotorGuard guard(lock_);
+  MotorExecutionStats d{};d.supported=true;d.error=static_cast<std::uint32_t>(error_);
+  d.superseded=superseded_;d.applied_latency_max_us=applied_latency_max_us_;
+  if (in_flight_) {
+    d.batch_flags|=4U;
+    d.pending_seq=pending_.seq;
+    d.pending_age_us=static_cast<std::uint32_t>(std::min<std::uint64_t>(now>=pending_at_?now-pending_at_:0,UINT32_MAX));
+    for (unsigned s=0;s<2;++s) if (batch_started_[s]==token_) d.batch_flags|=1U<<s;
+  }
+  for (unsigned s=0;s<2;++s) {
+    const auto& m=state_[s];
+    d.cycle_us[s]=m.active_cycle_us;d.cycle_max_us[s]=m.active_cycle_max_us;
+    d.io_us[s]=m.active_io_us;d.io_max_us[s]=m.active_io_max_us;
+    d.bus_error[s]=static_cast<std::uint32_t>(m.error);
+    d.bus_stage[s]=static_cast<std::uint32_t>(m.fault_context.bus_error);
+    if (m.fault_context.expired_lease) d.batch_flags|=1U<<(8+2*s);
+    if (m.fault_context.expired_batch) d.batch_flags|=1U<<(9+2*s);
+  }
+  return d;
+}
+BatchClaim BlMotorBackend::claimBatch(unsigned side, const MotorBatch& batch, std::uint64_t now) noexcept {
+  MotorGuard guard(lock_);
+  if (side>=2 || !request_[side].active || request_[side].generation!=batch.generation)
+    return BatchClaim::Cancelled;
+  if (!in_flight_ || request_[side].batch.token!=batch.token) return BatchClaim::Superseded;
+  if (now>=request_[side].lease_us || now>=batch.deadline_us) return BatchClaim::Expired;
+  batch_started_[side]=batch.token;
+  return BatchClaim::Claimed;
 }
 bool BlMotorBackend::captureHome(const std::array<float,4>& q, std::uint64_t now) noexcept {
   MotorGuard guard(lock_);
@@ -168,7 +222,7 @@ bool BlMotorBackend::captureHome(const std::array<float,4>& q, std::uint64_t now
   }
   for (unsigned s=0;s<2;++s) {
     zero_[s][0]=q[s]-config_.sign[s][0]*state_[s].raw_q[0];
-    zero_[s][1]=q[s]+q[2+s]-config_.sign[s][1]*state_[s].raw_q[1];
+    zero_[s][1]=config_.knee_crank_coupling*q[s]+q[2+s]-config_.sign[s][1]*state_[s].raw_q[1];
     zero_[s][2]=-config_.sign[s][2]*state_[s].raw_q[2];
   }
   homed_=true; return true;
@@ -181,7 +235,7 @@ bool BlMotorBackend::makeBatch(const HcrTarget& t, std::uint32_t seq,
   if (t.profile<HCR_HOME_PD || t.profile>HCR_POLICY_PD || (t.flags&~3U)) return false;
   for (auto v:t.target) if (!std::isfinite(v)) return false;
   for (auto v:t.feedforward) if (!std::isfinite(v)) return false;
-  const auto gain=config_.profile[t.profile-1];
+  const float coupling=config_.knee_crank_coupling;
   for (unsigned s=0;s<2;++s) {
     auto& b=next[s]; b.flags=t.flags; b.epoch=t.epoch; b.seq=seq; b.deadline_us=deadline;
     b.generation=request_[s].generation; b.token=token_+1;
@@ -191,22 +245,27 @@ bool BlMotorBackend::makeBatch(const HcrTarget& t, std::uint32_t seq,
     for (unsigned j=0;j<2;++j) {
       if (!(t.flags&1U)) {
         actual.target[j*2+s]=have_complete_?completed_.target[j*2+s]:
-          config_.sign[s][j]*state_[s].raw_q[j]+zero_[s][j];
+          config_.sign[s][j]*state_[s].raw_q[j]+zero_[s][j]+
+          (j?(1-coupling)*actual.target[s]:0.F);
         continue;
       }
       std::int32_t kp,kd,pos,rpm;
       // HOME/POLICY have zero FF; RECOVERY FF is hip / knee hinge.
+      const auto gain=(j?config_.knee_profile:config_.profile)[t.profile-1];
       const float ff=t.profile==HCR_RECOVERY ?
-        t.feedforward[s]+(j?t.feedforward[2+s]:0.F) : 0.F;
-      const float target=t.target[j*2+s];
+        (j?t.feedforward[2+s]+coupling*t.feedforward[s]:t.feedforward[s]) : 0.F;
+      const float target=j?knee+coupling*hip:hip;
       if (!quantize(gain.kp*1000.F,0,state_[s].kp_max[j],kp) ||
           !quantize(gain.kd*1000.F,0,state_[s].kd_max[j],kd) ||
           !quantize(config_.sign[s][j]*(target-zero_[s][j])/count_rad,-32768,32767,pos) ||
           !quantize(config_.sign[s][j]*ff/rpm_rad,-32768,32767,rpm)) return false;
-      put(b.joint[j].data(),kp); put(b.joint[j].data()+2,kd);
-      put(b.joint[j].data()+4,pos); put(b.joint[j].data()+6,rpm);
-      put(b.joint[j].data()+8,0); // direct position/velocity interface, tau_ff=0
-      actual.target[j*2+s]=config_.sign[s][j]*pos*count_rad+zero_[s][j];
+      // Validate first: the source codec's clamping helpers must not hide range errors.
+      const frame::MitBlock block{static_cast<std::uint16_t>(kp),static_cast<std::uint16_t>(kd),
+        static_cast<std::int16_t>(pos),static_cast<std::int16_t>(rpm),0};
+      const auto packet=frame::buildMitWrite(config_.id[j],block);
+      std::copy_n(packet.bytes.begin()+6,b.joint[j].size(),b.joint[j].begin());
+      actual.target[j*2+s]=config_.sign[s][j]*frame::countsToRad(pos)+zero_[s][j]+
+        (j?(1-coupling)*actual.target[s]:0.F);
     }
     float omega=t.target[4+s];
     if ((t.flags&2U) && std::abs(omega/rpm_rad)>config_.wheel_max_rpm) return false; // no hidden clamp
@@ -221,6 +280,7 @@ bool BlMotorBackend::makeBatch(const HcrTarget& t, std::uint32_t seq,
     b.wheel_rpm=rpm; actual.target[4+s]=config_.sign[s][2]*rpm*rpm_rad;
   }
   ++token_; pending_=actual; pending_at_=now;
+  batch_started_={};
   for (unsigned s=0;s<2;++s) request_[s].batch=next[s];
   in_flight_=true; return true;
 }
@@ -243,14 +303,25 @@ ApplyResult BlMotorBackend::apply(const HcrTarget& t, std::uint32_t seq,
   if (in_flight_ && state_[0].completed==token_ && state_[1].completed==token_ &&
       state_[0].generation==request_[0].generation && state_[1].generation==request_[1].generation) {
     completed_=pending_; have_complete_=true; in_flight_=false; applied_at_=pending_at_;
+    applied_latency_max_us_=std::max(applied_latency_max_us_,static_cast<std::uint32_t>(
+        std::min<std::uint64_t>(now>=pending_at_?now-pending_at_:0,UINT32_MAX)));
     for (auto& r:request_) r.batch={};
   }
-  if (!in_flight_ && (!have_complete_ || completed_.seq!=seq) &&
-      state_[0].prepared && state_[1].prepared &&
+  const bool batch_ready=state_[0].prepared && state_[1].prepared &&
       (!(t.flags&2U) || (state_[0].wheel_ready && state_[1].wheel_ready) ||
        (t.target[4]==0.F && t.target[5]==0.F)) &&
-      state_[0].generation==request_[0].generation && state_[1].generation==request_[1].generation) {
-    if (!makeBatch(t,seq,deadline,now)) {
+      state_[0].generation==request_[0].generation && state_[1].generation==request_[1].generation;
+  // Replace only a batch that neither bus has claimed. A started/partially
+  // applied batch retains its token, reference and original deadline.
+  if (in_flight_ && batch_ready && pending_.seq!=seq && !batch_started_[0] && !batch_started_[1]) {
+    if (!makeBatch(t,seq,request_[0].lease_us,now)) {
+      error_=MotorError::Range;cancel();return ApplyResult::Fault;
+    }
+    ++superseded_;
+  }
+  if (!in_flight_ && (!have_complete_ || completed_.seq!=seq) &&
+      batch_ready) {
+    if (!makeBatch(t,seq,request_[0].lease_us,now)) {
       error_=MotorError::Range; cancel(); return ApplyResult::Fault;
     }
   }
@@ -259,7 +330,21 @@ ApplyResult BlMotorBackend::apply(const HcrTarget& t, std::uint32_t seq,
 }
 
 void BlMotorWorker::fail(MotorError e) noexcept {
-  if (state_.error==MotorError::None) state_.error=e;
+  if (state_.error==MotorError::None) {
+    state_.error=e;
+    auto& f=state_.fault_context;
+    f.at_us=bus_.now(); f.during_io=request_in_progress_;
+    f.id=request_id_; f.instruction=request_instruction_; f.address=request_address_;
+    f.bus_error=request_error_; f.trace=bus_.trace();
+    if (guard_active_) {
+      f.lease_us=request_in_progress_ ? guard_request_.lease_us : owner_.request(side_).lease_us;
+      f.expired_lease=e==MotorError::Expired && f.at_us>=f.lease_us;
+      f.expired_batch=e==MotorError::Expired && batch_io_ &&
+        guard_request_.batch.token && f.at_us>=guard_request_.batch.deadline_us;
+      f.batch_deadline_us=guard_request_.batch.deadline_us;
+      f.batch_seq=guard_request_.batch.seq;
+    }
+  }
   state_.prepared=false; ++state_.errors; owner_.trip(e);
 }
 void BlMotorWorker::feedbackFailure(FeedbackError reason, unsigned j, int previous,
@@ -292,6 +377,7 @@ void BlMotorWorker::jointSample(unsigned j, const BusReply& r) noexcept {
   }
   previous_joint_[j]=r.position; state_.raw_q[j]=r.position*count_rad;
   state_.stamp[j]=now;
+  owner_.publishSample(side_,j,state_);
 }
 bool BlMotorWorker::busPermitValid(void* context) noexcept {
   auto& self=*static_cast<BlMotorWorker*>(context);
@@ -302,10 +388,19 @@ bool BlMotorWorker::requestBus(BusFormat fmt, std::uint8_t id, std::uint8_t inst
                                const std::uint8_t* p, std::size_t n,
                                std::size_t read, BusReply& reply) noexcept {
   request_error_=BusError::None;
+  request_in_progress_=true;
+  request_id_=id; request_instruction_=inst; request_address_=n?p[0]:0;
   BusPermit permit{};
   if (guard_active_) {
-    permit.deadline_us=guard_request_.lease_us;
-    if (guard_request_.batch.token && state_.completed!=guard_request_.batch.token)
+    // Refresh the LF lease between I/O calls, never during a call. Startup
+    // and feedback polling must not inherit an older step's lease snapshot.
+    const auto latest=owner_.request(side_);
+    if (!latest.active || latest.generation!=guard_request_.generation) {
+      request_error_=BusError::Cancelled;request_in_progress_=false;return false;
+    }
+    guard_request_.lease_us=latest.lease_us;
+    permit.deadline_us=latest.lease_us;
+    if (batch_io_)
       permit.deadline_us=std::min(permit.deadline_us,guard_request_.batch.deadline_us);
     permit.valid=busPermitValid; permit.context=this;
   }
@@ -314,10 +409,16 @@ bool BlMotorWorker::requestBus(BusFormat fmt, std::uint8_t id, std::uint8_t inst
     request_error_=permit.deadline_us && bus_.now()>=permit.deadline_us?BusError::Deadline:BusError::Cancelled;
     bus_.setPermit({});
     if (request_error_==BusError::Deadline) fail(MotorError::Expired);
+    request_in_progress_=false;
     return false;
   }
   ++state_.transactions;
+  const auto started=bus_.now();
   const bool ok=bus_.request(fmt,id,inst,p,n,read,reply);
+  if (guard_active_) {
+    state_.active_io_us=static_cast<std::uint32_t>(std::min<std::uint64_t>(bus_.now()-started,UINT32_MAX));
+    state_.active_io_max_us=std::max(state_.active_io_max_us,state_.active_io_us);
+  }
   // Mock buses and hardware must both reject a completion after cancellation/expiry.
   request_error_=bus_.lastError();
   const bool still_permitted=bus_.permitted();
@@ -326,8 +427,10 @@ bool BlMotorWorker::requestBus(BusFormat fmt, std::uint8_t id, std::uint8_t inst
     request_error_=(permit.deadline_us && bus_.now()>=permit.deadline_us) || bus_.lastError()==BusError::Deadline ?
          BusError::Deadline:BusError::Cancelled;
     if (request_error_==BusError::Deadline) fail(MotorError::Expired);
+    request_in_progress_=false;
     return false;
   }
+  request_in_progress_=false;
   return ok;
 }
 bool BlMotorWorker::transact(unsigned j, std::uint8_t inst,
@@ -355,6 +458,25 @@ bool BlMotorWorker::transact(unsigned j, std::uint8_t inst,
   if (out) *out=reply;
   return state_.error==MotorError::None;
 }
+bool BlMotorWorker::writeVerified(unsigned j, std::uint8_t address, std::uint8_t value) noexcept {
+  const std::uint8_t write[2]={address,value}, read[2]={address,1};
+  BusReply reply{};
+  if (requestBus(j==2?BusFormat::Wheel:BusFormat::Joint,owner_.config().id[j],3,write,2,0,reply)) {
+    state_.status[j]=reply.status;
+    if (reply.status) { recordFailure(j,3,address,BusError::None); fail(MotorError::Status); return false; }
+    if (j<2) jointSample(j,reply);
+  } else {
+    if (state_.error!=MotorError::None || request_error_==BusError::Cancelled) return false;
+    if (request_error_!=BusError::ReplyTimeout && request_error_!=BusError::WriteEchoOnly) {
+      recordFailure(j,3,address,request_error_); fail(MotorError::Bus); return false;
+    }
+  }
+  if (state_.error!=MotorError::None || !transact(j,2,read,2,1,&reply)) return false;
+  if (reply.data[0]!=value) {
+    recordFailure(j,2,address,BusError::ReadbackMismatch); fail(MotorError::Configuration); return false;
+  }
+  return true;
+}
 bool BlMotorWorker::torque(unsigned j, bool enable) noexcept {
   const std::uint8_t p[2]={0x18,static_cast<std::uint8_t>(enable)};
   // OFF works after a latched fault. Verify the actual enable register rather
@@ -364,7 +486,7 @@ bool BlMotorWorker::torque(unsigned j, bool enable) noexcept {
     BusReply reply{}; const auto fmt=j==2?BusFormat::Wheel:BusFormat::Joint;
     const auto id=owner_.config().id[j];
     const bool wrote=requestBus(fmt,id,3,p,2,0,reply);
-    if (!wrote) recordFailure(j,3,0x18,request_error_);
+    if (!wrote && request_error_!=BusError::WriteEchoOnly) recordFailure(j,3,0x18,request_error_);
     const std::uint8_t read[2]={0x18,1};
     const bool read_ok=requestBus(fmt,id,2,read,2,1,reply);
     guard_active_=guarded;
@@ -377,6 +499,10 @@ bool BlMotorWorker::torque(unsigned j, bool enable) noexcept {
   }
   on_[j]=true; // an unacknowledged enable may still have reached the driver
   state_.torque_enable[j]=255;
+  if (j==2) {
+    if (!writeVerified(j,0x18,1)) return false;
+    state_.torque_enable[j]=1; return true;
+  }
   return transact(j,3,p,2);
 }
 bool BlMotorWorker::wheelSpeed(std::int16_t rpm) noexcept {
@@ -399,7 +525,7 @@ bool BlMotorWorker::wheelSpeed(std::int16_t rpm) noexcept {
   if (error==BusError::Cancelled) return false;
   // BL4012e does not require a speed-write ACK. HCR additionally requires
   // evidence of the latched target: only a missing reply may use readback.
-  if (error!=BusError::ReplyTimeout) {
+  if (error!=BusError::ReplyTimeout && error!=BusError::WriteEchoOnly) {
     recordFailure(2,3,0x20,error); fail(MotorError::Bus); return false;
   }
   const std::uint8_t read[2]={0x20,2};
@@ -440,6 +566,7 @@ bool BlMotorWorker::wheelRead() noexcept {
   previous_wheel_=pos; state_.stamp[2]=now;
   state_.raw_q[2]=wheel_counts_*(2*pi/1024.F);
   state_.raw_qd[2]=static_cast<std::int16_t>(u16(r.data.data()+2))*rpm_rad;
+  owner_.publishSample(side_,2,state_);
   return true;
 }
 bool BlMotorWorker::off() noexcept {
@@ -455,18 +582,23 @@ bool BlMotorWorker::off() noexcept {
 bool BlMotorWorker::configure() noexcept {
   if (!off()) return false;
   for (unsigned j=0;j<2;++j) {
-    BusReply r{}; const std::uint8_t level[2]={0x10,1}, limits[2]={0x32,4}, mode[2]={0x2d,3};
+    BusReply r{}; const std::uint8_t level[2]={0x10,1}, limits[2]={0x32,4};
     if (!transact(j,2,level,2,1,&r)) return false;
-    if (r.data[0]!=2) { fail(MotorError::Configuration); return false; }
+    if (r.data[0]!=2 && !writeVerified(j,0x10,2)) return false;
     if (!transact(j,2,limits,2,4,&r)) return false;
     state_.kp_max[j]=u16(r.data.data()); state_.kd_max[j]=u16(r.data.data()+2);
-    for (const auto& g:owner_.config().profile)
+    for (const auto& g:(j?owner_.config().knee_profile:owner_.config().profile))
       if (!std::isfinite(g.kp) || !std::isfinite(g.kd) || g.kp<0 || g.kd<0 ||
           g.kp*1000>state_.kp_max[j] || g.kd*1000>state_.kd_max[j]) {
         fail(MotorError::Configuration); return false;
       }
-    if (!transact(j,3,mode,2)) return false;
+    if (!writeVerified(j,0x2d,3)) return false;
   }
+  // Lumi-Quantum reads wheel response level at boot. A no-write-reply driver
+  // uses echo + settle + verified register readback, without a 9 ms ACK wait.
+  const std::uint8_t level[2]={0x10,1}; BusReply wheel_level{};
+  if (!transact(2,2,level,2,1,&wheel_level)) return false;
+  bus_.setWheelWriteReplies(wheel_level.data[0]>=2);
   // Like the bench: disarmed setup only reads the wheel, never writes speed.
   if (!wheelRead()) return false;
   // Prove that the goal-register readback required by HCR startup is supported
@@ -477,11 +609,21 @@ bool BlMotorWorker::configure() noexcept {
   state_.configured=true; return true;
 }
 bool BlMotorWorker::poll(const MotorRequest* active) noexcept {
+  const auto pending_batch=[&]() {
+    if (!active || !state_.prepared) return false;
+    const auto latest=owner_.request(side_);
+    return latest.active && latest.generation==active->generation &&
+      latest.batch.token && latest.batch.token!=state_.completed;
+  };
   for (unsigned j=0;j<2;++j) {
     if (active && !allowed(*active,false)) return false;
+    // A feedback sweep is background work. Finish the current transaction,
+    // then give a newly queued TARGET the next worker step, without faulting.
+    if (pending_batch()) return true;
     if (!transact(j,1,nullptr,0)) return false;
   }
   if (active && !allowed(*active,false)) return false;
+  if (pending_batch()) return true;
   return wheelRead();
 }
 bool BlMotorWorker::allowed(const MotorRequest& r, bool batch) noexcept {
@@ -495,6 +637,11 @@ bool BlMotorWorker::allowed(const MotorRequest& r, bool batch) noexcept {
 void BlMotorWorker::step() noexcept {
   const auto started=bus_.now(); auto r=owner_.request(side_);
   guard_request_=r; guard_active_=r.active;
+  batch_io_=false;
+  if (r.active && !was_active_) {
+    state_.active_cycle_us=state_.active_cycle_max_us=state_.active_io_us=state_.active_io_max_us=0;
+  }
+  was_active_=r.active;
   if (!validMotorConfig(owner_.config())) { fail(MotorError::Configuration); return; }
   if (r.reset_generation!=state_.reset_generation) {
     state_={}; state_.reset_generation=r.reset_generation;
@@ -542,8 +689,11 @@ void BlMotorWorker::step() noexcept {
       if (!want_wheel || wheel_zero_verified_) state_.prepared=true;
     }
     state_.wheel_ready=want_wheel && settled && state_.prepared;
-    if (state_.prepared && r.batch.token && state_.completed!=r.batch.token && allowed(r,true)) {
-      bool ok=true;
+    if (state_.prepared && r.batch.token && state_.completed!=r.batch.token) {
+      const auto claim=owner_.claimBatch(side_,r.batch,bus_.now());
+      if (claim==BatchClaim::Expired) { batch_io_=true; fail(MotorError::Expired); }
+      batch_io_=claim==BatchClaim::Claimed;
+      bool ok=batch_io_ && allowed(r,true);
       for (unsigned j=0;j<2 && ok;++j) {
         if (!allowed(r,true)) { ok=false; break; }
         if (r.batch.flags&1U) {
@@ -562,7 +712,18 @@ void BlMotorWorker::step() noexcept {
       } else ok=false;
       if (ok && allowed(r,true)) ok=wheelRead();
       if (ok && allowed(r,true)) state_.completed=r.batch.token;
-    } else if (allowed(r,false)) poll(&r);
+      batch_io_=false;
+    } else if (allowed(r,false)) {
+      // MIT replies and the batch wheel read already refresh feedback. Do not
+      // immediately launch another three-I/O sweep while the peer bus finishes.
+      // Poll stale samples independently of TARGET arrival; validity limits
+      // and the mandatory per-batch wheel read remain unchanged.
+      const auto poll_age=std::min<std::uint64_t>(3000,
+          std::max<std::uint64_t>(1,owner_.config().feedback_age_us/2));
+      bool recent=true;
+      for (auto stamp:state_.stamp) recent&=fresh(stamp,bus_.now(),poll_age);
+      if (!recent) poll(&r);
+    }
   }
   // Cancellation may arrive during any bus wait; disable before publishing.
   const auto after=owner_.request(side_);
@@ -572,6 +733,10 @@ void BlMotorWorker::step() noexcept {
     state_.prepared=false; state_.generation=after.generation;
   }
   const auto duration=bus_.now()-started;
+  if (r.active) {
+    state_.active_cycle_us=static_cast<std::uint32_t>(std::min<std::uint64_t>(duration,UINT32_MAX));
+    state_.active_cycle_max_us=std::max(state_.active_cycle_max_us,state_.active_cycle_us);
+  }
   state_.cycle_max_us=std::max(state_.cycle_max_us,static_cast<std::uint32_t>(duration));
   state_.bus_stats=bus_.stats();
   owner_.publish(side_,state_);

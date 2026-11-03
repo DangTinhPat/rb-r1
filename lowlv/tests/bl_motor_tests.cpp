@@ -24,7 +24,9 @@ struct FakeBus final:MotorBus {
   int fail_id=0, fail_addr=-1, fail_inst=0;
   bool corrupt=false;
   int fail_remaining=-1;
-  bool drop_speed_write=false, ignore_off=false;
+  bool drop_speed_write=false, ignore_off=false, ignore_enable=false;
+  bool ignore_config=false, wheel_write_replies=true;
+  std::array<std::uint8_t,3> response_level{{2,2,2}}, mode{{0,0,0}};
   BusError error=BusError::None, injected_error=BusError::ReplyTimeout;
   std::uint8_t status=0;
   std::uint16_t gain_cap=5000;
@@ -32,6 +34,7 @@ struct FakeBus final:MotorBus {
   explicit FakeBus(std::uint64_t& time):clock(time) {}
   std::uint64_t now() const noexcept override { return clock; }
   BusError lastError() const noexcept override { return error; }
+  void setWheelWriteReplies(bool enabled) noexcept override { wheel_write_replies=enabled; }
   bool request(BusFormat fmt,std::uint8_t id,std::uint8_t inst,const std::uint8_t* p,
                std::size_t n,std::size_t read,BusReply& out) noexcept override {
     error=BusError::None;
@@ -42,14 +45,21 @@ struct FakeBus final:MotorBus {
     if (hook) { auto f=std::move(hook);hook=nullptr;f(); }
     const unsigned j=id==2?0:id==3?1:2;
     // The physical write can succeed while its reply is lost.
-    if (inst==3 && n>=2 && p[0]==0x18 && (p[1] || !ignore_off)) enabled[j]=p[1];
+    if (inst==3 && n>=2 && p[0]==0x18 && (p[1]? !ignore_enable: !ignore_off)) enabled[j]=p[1];
     if (inst==3 && n==11 && p[0]==0x1a) {
       position[j]=static_cast<std::int16_t>(p[5]|(std::uint16_t(p[6])<<8)); enabled[j]=true;
     }
     if (inst==3 && n==3 && p[0]==0x20 && !drop_speed_write) wheel_rpm=static_cast<std::int16_t>(p[1]|(std::uint16_t(p[2])<<8));
+    if (inst==3 && n==2 && !ignore_config) {
+      if (p[0]==0x10) response_level[j]=p[1];
+      if (p[0]==0x2d) mode[j]=p[1];
+    }
     if (fail_remaining!=0 && fail_id==id && (fail_addr<0 || (n && p[0]==fail_addr)) && (!fail_inst || fail_inst==inst)) {
       if (fail_remaining>0) --fail_remaining;
       error=injected_error; return false;
+    }
+    if (fmt==BusFormat::Wheel && inst==3 && !wheel_write_replies) {
+      error=BusError::WriteEchoOnly; return false;
     }
     const unsigned echo=fmt==BusFormat::Wheel?5:7, count=echo+4+read;
     std::array<std::uint8_t,48> rx{};
@@ -57,7 +67,8 @@ struct FakeBus final:MotorBus {
     if (j<2) { rx[5]=position[j]&255;rx[6]=(std::uint16_t(position[j])>>8)&255; }
     rx[echo]=n+2;rx[echo+1]=inst;rx[echo+2]=n?p[0]:0;
     auto* data=rx.data()+echo+3;
-    if (read && p[0]==0x10) data[0]=2;
+    if (read && p[0]==0x10) data[0]=response_level[j];
+    if (read && p[0]==0x2d) data[0]=mode[j];
     if (read && p[0]==0x18) data[0]=enabled[j];
     if (read && p[0]==0x32) { data[0]=0xff;data[1]=0xff;data[2]=gain_cap&255;data[3]=gain_cap>>8; }
     if (read && p[0]==0x20) { data[0]=wheel_rpm&255;data[1]=(std::uint16_t(wheel_rpm)>>8)&255; }
@@ -83,7 +94,7 @@ struct Rig {
   BlMotorBackend motor;
   FakeBus left,right;
   BlMotorWorker lw,rw;
-  Rig():motor(lock),left(now),right(now),lw(motor,0,left),rw(motor,1,right) { idle(); }
+  explicit Rig(BlMotorConfig config={}):motor(lock,config),left(now),right(now),lw(motor,0,left),rw(motor,1,right) { idle(); }
   void workers() { lw.step();rw.step(); }
   void idle() { for(unsigned i=0;i<8;++i){workers();now+=1000;} }
   void home() {
@@ -202,12 +213,44 @@ int main(int argc,char** argv) {
     assert(!motorReply(BusFormat::Wheel,1,3,0x1a,13,reply,sizeof reply,0,result));
     assert(!motorPacket(0xfe,3,p,sizeof p,out));
   }
+  { // HCR HOME uses the actual backend's software offset, with zero driver writes.
+    Rig r;GatewayCore core(r.motor);
+    HcrFrame hello{};hello.type=HCR_HELLO;hello.size=12;hello.seq=1;hello.stamp_us=1;
+    hcr_put32(hello.payload,7);hcr_put16(hello.payload+4,200);hcr_put16(hello.payload+6,100);hcr_put32(hello.payload+8,HCR_SCHEMA);
+    core.receive(hello,r.now);core.tick(r.now);
+    auto telemetry=decode(core.telemetry(r.now));core.telemetrySent(7,telemetry.seq,telemetry.stamp_us);
+    HcrFrame home{};home.type=HCR_ENCODER_HOME;home.size=8;home.seq=2;home.stamp_us=2;
+    hcr_put32(home.payload,7);hcr_put32(home.payload+4,telemetry.seq);
+    const auto left=r.left.frames.size(),right=r.right.frames.size();
+    auto result=decode(core.receive(home,r.now));
+    assert(hcr_u32(result.payload+8)==HCR_HOME_APPLIED && r.motor.ready());
+    assert(left==r.left.frames.size() && right==r.right.frames.size());
+    assert(r.motor.disabled());auto f=r.motor.feedback(r.now);
+    close(f.q[0],2.35706715F);close(f.q[1],2.35706715F);close(f.q[2],0);close(f.q[3],0);
+    // Moving any joint must reject capture, even if motor enable is OFF.
+    r.left.position[0]+=100;r.now+=4000;r.workers();core.tick(r.now);
+    telemetry=decode(core.telemetry(r.now));core.telemetrySent(7,telemetry.seq,telemetry.stamp_us);
+    home.seq=3;home.stamp_us=3;hcr_put32(home.payload+4,telemetry.seq);
+    result=decode(core.receive(home,r.now));assert(hcr_u32(result.payload+8)==HCR_HOME_REFUSED);
+    assert(r.motor.disabled());
+    // Once manually repositioned and stationary, recapture the new reference
+    // without rebooting, writing a driver register or enabling any motor.
+    r.now+=4000;r.workers();core.tick(r.now);
+    f=r.motor.feedback(r.now);assert(std::abs(f.q[0]-2.35706715F)>.01F);
+    telemetry=decode(core.telemetry(r.now));core.telemetrySent(7,telemetry.seq,telemetry.stamp_us);
+    home.seq=4;home.stamp_us=4;hcr_put32(home.payload+4,telemetry.seq);
+    const auto left_after=r.left.frames.size(),right_after=r.right.frames.size();
+    result=decode(core.receive(home,r.now));assert(hcr_u32(result.payload+8)==HCR_HOME_APPLIED);
+    assert(left_after==r.left.frames.size() && right_after==r.right.frames.size());
+    f=r.motor.feedback(r.now);close(f.q[0],2.35706715F);
+    assert(r.motor.disabled() && !core.diagnostics(r.now).armed);
+  }
   { Rig r;assert(r.motor.disabled()&&!r.motor.ready());r.home();
     auto f=r.motor.feedback(r.now);close(f.q[0],2.35706715F);close(f.q[2],0);assert(!f.torque_valid);
     auto t=r.target();unsigned seq=1;r.run(t,seq);
     t.profile=HCR_POLICY_PD;t.target[0]=-.5;t.target[1]=-.4;t.target[2]=.6;t.target[3]=.7;
     t.target[4]=10;t.target[5]=-23;++seq;const auto out=r.run(t,seq);
-    // Physical LEFT UART2: hip +, crank -, wheel +. RIGHT UART1: -, +, -.
+    // Lumi physical LEFT UART2: hip +, knee +, wheel +. RIGHT UART1: -, -, -.
     const auto& lh=r.left.last(2,0x1a);const auto& lc=r.left.last(3,0x1a);
     const auto& rh=r.right.last(2,0x1a);const auto& rc=r.right.last(3,0x1a);
     assert(signed16(lh,10)<1000 && signed16(lc,10)>-2000);
@@ -221,9 +264,9 @@ int main(int argc,char** argv) {
     t.profile=HCR_RECOVERY;t.feedforward[0]=.1;t.feedforward[1]=-.2;
     t.feedforward[2]=.3;t.feedforward[3]=-.4;++seq;r.run(t,seq);
     assert(signed16(r.left.last(2,0x1a),12)==1);
-    assert(signed16(r.left.last(3,0x1a),12)==-4); // phi_dot = .1 + .3, sign -
+    assert(signed16(r.left.last(3,0x1a),12)==3); // direct knee FF=.3, sign +
     assert(signed16(r.right.last(2,0x1a),12)==2);
-    assert(signed16(r.right.last(3,0x1a),12)==-6);
+    assert(signed16(r.right.last(3,0x1a),12)==4); // direct knee FF=-.4, sign -
     r.motor.disable();assert(!r.motor.disabled());r.workers();assert(r.motor.disabled());
     assert(r.motor.resetFault() && r.motor.ready()); // ordinary LF RESET preserves home
   }
@@ -250,6 +293,172 @@ int main(int argc,char** argv) {
     const auto old=a.seq;r.lw.step();
     r.motor.apply(t,seq,r.now+20000,r.now,a);assert(a.seq==old);
     r.rw.step();assert(r.motor.apply(t,seq,r.now+20000,r.now,a)==ApplyResult::Applied&&a.seq==seq);
+  }
+  { // Latest queued TARGET wins only before either bus claims it.
+    Rig r;r.home();auto t=r.target();unsigned seq=1;r.run(t,seq);MotorApplied a{};
+    r.motor.apply(t,seq,r.now+20000,r.now,a); // consume final completion
+    const auto applied=a.seq;
+    ++seq;r.motor.apply(t,seq,r.now+20000,r.now,a);
+    const auto old=r.motor.request(0).batch;
+    t.target[0]-=.01F;t.target[2]-=.01F;++seq;
+    r.motor.apply(t,seq,r.now+20000,r.now,a);
+    const auto fresh=r.motor.request(0).batch;
+    assert(fresh.token!=old.token && fresh.seq==seq && a.seq==applied);
+    assert(r.motor.claimBatch(0,old,r.now)==BatchClaim::Superseded);
+    assert(r.motor.executionStats(r.now).superseded==1);
+    r.lw.step();r.motor.apply(t,seq,r.now+20000,r.now,a);assert(a.seq==applied);
+    r.rw.step();r.motor.apply(t,seq,r.now+20000,r.now,a);assert(a.seq==seq);
+    assert(r.motor.executionStats(r.now).io_max_us[0]>0);
+  }
+  { // A worker snapshot superseded during wheel OFF cannot transmit old MIT.
+    Rig r;r.home();auto t=r.target();unsigned seq=1;r.run(t,seq);MotorApplied a{};
+    r.motor.apply(t,seq,r.now+20000,r.now,a);
+    t.flags=1;++seq;r.motor.apply(t,seq,r.now+20000,r.now,a);
+    const auto old=r.motor.request(0).batch; r.left.frames.clear();
+    r.left.hook=[&](){
+      t.target[0]-=.01F;t.target[2]-=.01F;++seq;
+      r.motor.apply(t,seq,r.now+20000,r.now,a);
+    };
+    r.lw.step();assert(r.motor.request(0).batch.token!=old.token);
+    for(const auto& frame:r.left.frames) assert(!(frame[4]==3 && frame[5]==0x1a));
+    assert(r.motor.diagnostics().error==MotorError::None);
+    r.workers();r.motor.apply(t,seq,r.now+20000,r.now,a);assert(a.seq==seq);
+  }
+  { // Replacing queued zero HOME must not bypass the wheel settle condition.
+    Rig r;r.home();auto t=r.target();MotorApplied a{};
+    r.motor.apply(t,1,r.now+20000,r.now,a);r.workers();
+    r.motor.apply(t,2,r.now+20000,r.now,a);
+    const auto zero=r.motor.request(0).batch;
+    assert(zero.token && !r.motor.diagnostics().leg[0].wheel_ready);
+    t.target[4]=t.target[5]=3;
+    r.motor.apply(t,3,r.now+20000,r.now,a);
+    assert(r.motor.request(0).batch.token==zero.token);
+    assert(r.motor.request(0).batch.wheel_rpm==0);
+    assert(r.motor.executionStats(r.now).superseded==0);
+    r.workers();r.motor.apply(t,3,r.now+20000,r.now,a);
+    assert(a.seq==2 && a.target[4]==0 && a.target[5]==0);
+  }
+  { // One bus claiming freezes reference, token and original deadline for BOTH.
+    Rig r;r.home();auto t=r.target();unsigned seq=1;r.run(t,seq);MotorApplied a{};
+    r.motor.apply(t,seq,r.now+20000,r.now,a);
+    ++seq;r.motor.apply(t,seq,r.now+20000,r.now,a);
+    const auto old=r.motor.request(0).batch;
+    r.lw.step();assert(r.motor.executionStats(r.now).batch_flags==5);
+    t.target[0]-=.01F;t.target[2]-=.01F;++seq;
+    r.motor.apply(t,seq,r.now+20000,r.now,a);
+    assert(r.motor.request(1).batch.token==old.token);
+    assert(r.motor.request(1).batch.deadline_us==old.deadline_us);
+    assert(r.motor.request(0).batch.joint==old.joint);
+    // New valid targets cannot rescue an already-started expired batch.
+    r.now=old.deadline_us;
+    r.rw.step();assert(r.motor.diagnostics().error==MotorError::Expired);
+    assert(r.motor.diagnostics().leg[1].fault_context.expired_batch);
+    assert(!r.motor.diagnostics().leg[1].fault_context.expired_lease);
+    assert(r.motor.executionStats(r.now).batch_flags & (1U<<11));
+    r.lw.step();assert(r.motor.disabled());
+  }
+  { // Duplicate submit cannot renew the lease; disable cancels stale claims.
+    Rig r;r.home();auto t=r.target();MotorApplied a{};unsigned seq=1;r.run(t,seq);
+    ++seq;const auto deadline=r.now+20000;
+    r.motor.apply(t,seq,deadline,r.now,a);const auto batch=r.motor.request(0).batch;
+    r.motor.apply(t,seq,deadline+10000,r.now,a);
+    assert(r.motor.request(0).lease_us==deadline);
+    r.motor.disable();assert(r.motor.claimBatch(0,batch,r.now)==BatchClaim::Cancelled);
+    r.workers();assert(r.motor.disabled());
+  }
+  { // During startup/poll, newer TARGET renews lease BETWEEN bus transactions.
+    Rig r;r.home();auto t=r.target();t.flags=1;MotorApplied a{};
+    r.now+=4000; // make feedback due for polling
+    const auto before=r.now;r.motor.apply(t,1,before+400,before,a);
+    r.left.latency=300;
+    r.left.hook=[&](){r.motor.apply(t,2,r.now+20000,r.now,a);};
+    r.lw.step();
+    assert(r.now>before+400 && r.motor.diagnostics().error==MotorError::None);
+    assert(r.motor.diagnostics().leg[0].active_io_max_us==300);
+  }
+  { // A newer TARGET during one I/O cannot extend that I/O's fixed deadline.
+    Rig r;r.home();auto t=r.target();t.flags=1;MotorApplied a{};
+    r.now+=4000; // make feedback due for polling
+    r.motor.apply(t,1,r.now+400,r.now,a);r.left.latency=600;
+    r.left.hook=[&](){r.motor.apply(t,2,r.now+20000,r.now,a);};
+    r.lw.step();assert(r.motor.diagnostics().error==MotorError::Expired);
+    assert(r.motor.diagnostics().leg[0].fault_context.during_io);
+    assert(r.motor.diagnostics().leg[0].fault_context.expired_lease);
+    r.rw.step();assert(r.motor.disabled());
+  }
+  { // Service may run while the worker waits for the NEXT motor's reply.
+    Rig r;r.home();auto t=r.target();unsigned seq=1;r.run(t,seq);MotorApplied a{};
+    r.motor.apply(t,seq,r.now+20000,r.now,a);
+    const auto previous_ack=a.seq;
+    auto states=r.motor.diagnostics().leg;
+    for(auto& state:states) state.stamp.fill(r.now);
+    states[0].stamp[0]=r.now-19000;
+    for(unsigned side=0;side<2;++side) r.motor.publish(side,states[side]);
+    ++seq;r.motor.apply(t,seq,r.now+20000,r.now,a);
+    const auto token=r.motor.request(0).batch.token;
+    r.left.latency=700;bool checked=false;
+    r.left.hook=[&](){r.left.hook=[&](){
+      // Hip was received 700 us ago; the old shared hip stamp is now 20.4 ms old.
+      assert(r.motor.feedback(r.now).encoders_valid);
+      assert(r.motor.diagnostics().leg[0].stamp[0]==r.now-700);
+      assert(r.motor.diagnostics().leg[0].completed!=token);
+      r.motor.apply(t,seq,r.now+20000,r.now,a);assert(a.seq==previous_ack);
+      checked=true;
+    };};
+    r.lw.step();assert(checked);
+    r.motor.apply(t,seq,r.now+20000,r.now,a);assert(a.seq==previous_ack);
+    r.rw.step();r.motor.apply(t,seq,r.now+20000,r.now,a);assert(a.seq==seq);
+  }
+  { // One fresh sample cannot hide a genuinely stale sample on the other bus.
+    Rig r;r.home();auto t=r.target();unsigned seq=1;r.run(t,seq);MotorApplied a{};
+    r.motor.apply(t,seq,r.now+20000,r.now,a);
+    ++seq;r.motor.apply(t,seq,r.now+20000,r.now,a);
+    auto state=r.motor.diagnostics().leg[1];state.stamp[1]=r.now-20001;
+    r.motor.publish(1,state);
+    bool checked=false;
+    r.left.hook=[&](){r.left.hook=[&](){
+      assert(!r.motor.feedback(r.now).encoders_valid);checked=true;
+    };};
+    r.lw.step();assert(checked);
+  }
+  { // Corrupt or cancelled replies cannot refresh a sensor timestamp.
+    for(bool cancel:{false,true}) {
+      Rig r;r.home();auto t=r.target();unsigned seq=1;r.run(t,seq);MotorApplied a{};
+      r.motor.apply(t,seq,r.now+20000,r.now,a);
+      ++seq;r.motor.apply(t,seq,r.now+20000,r.now,a);
+      const auto stamp=r.motor.diagnostics().leg[0].stamp[0];
+      if(cancel) r.left.hook=[&](){r.motor.disable();};
+      else r.left.corrupt=true;
+      r.lw.step();assert(r.motor.diagnostics().leg[0].stamp[0]==stamp);
+      assert(!r.motor.diagnostics().in_flight);
+    }
+  }
+  { // Late sensor publication from before RESET cannot repopulate the backend.
+    Rig r;const auto old=r.motor.diagnostics().leg[0];
+    r.motor.trip(MotorError::Bus);assert(r.motor.resetFault());
+    r.motor.publishSample(0,0,old);
+    assert(r.motor.diagnostics().leg[0].stamp[0]==0);
+    assert(!r.motor.feedback(r.now).encoders_valid);
+  }
+  { // Background feedback must yield between I/Os when a TARGET is queued.
+    Rig r;r.home();auto t=r.target();unsigned seq=1;r.run(t,seq);MotorApplied a{};
+    r.motor.apply(t,seq,r.now+20000,r.now,a); // no pending batch
+    r.now+=4000;r.left.frames.clear();
+    r.left.hook=[&](){
+      ++seq;r.motor.apply(t,seq,r.now+20000,r.now,a);
+    };
+    r.lw.step();
+    assert(r.left.frames.size()==1); // finish current ping; defer rest of poll
+    assert(r.motor.diagnostics().error==MotorError::None);
+    r.workers();r.motor.apply(t,seq,r.now+20000,r.now,a);assert(a.seq==seq);
+  }
+  { // Do not start a redundant poll immediately after an applied batch.
+    Rig r;r.home();auto t=r.target();unsigned seq=1;r.run(t,seq);MotorApplied a{};
+    r.motor.apply(t,seq,r.now+20000,r.now,a);r.left.frames.clear();
+    r.lw.step();assert(r.left.frames.empty());
+    // Idle feedback must still be polled and remain subject to driver faults.
+    r.now+=4000;r.left.status=0x20;r.lw.step();
+    assert(!r.left.frames.empty() && r.motor.diagnostics().error==MotorError::Status);
   }
   { // No clamp: impossible target must fault, disable and never ACK the new seq.
     Rig r;r.home();auto t=r.target();unsigned seq=1;r.run(t,seq);
@@ -359,14 +568,19 @@ int main(int argc,char** argv) {
     t.target[4]=3;
     ++seq;MotorApplied a{};r.motor.apply(t,seq,r.now+20000,r.now,a);r.workers();
     assert(r.motor.diagnostics().error==MotorError::Expired && r.motor.disabled());
+    const auto fault=r.motor.diagnostics().leg[0].fault_context;
+    assert(fault.during_io && fault.bus_error==BusError::Deadline && fault.id==1);
+    assert(fault.instruction==2 && fault.address==0x20 && fault.batch_seq!=0);
+    assert(fault.at_us>=fault.batch_deadline_us);
+    r.now+=100000;r.workers();
+    assert(r.motor.diagnostics().leg[0].fault_context.at_us==fault.at_us); // OFF cannot replace root cause
   }
-  { // Lost enable reply must still trigger wheel OFF (enable may have arrived).
+  { // Missing wheel enable ACK is accepted only with matching register readback.
     Rig r;r.home();auto t=r.target();MotorApplied a{};
     r.left.fail_id=1;r.left.fail_addr=0x18;r.left.fail_inst=3;
     r.motor.apply(t,1,r.now+20000,r.now,a);r.workers();
-    assert(r.motor.diagnostics().error==MotorError::Bus);
-    assert(!r.left.enabled[2]); // OFF attempted even though its ACK also lost
-    assert(r.motor.disabled()); // OFF readback succeeds despite missing write ACK
+    assert(r.motor.diagnostics().error==MotorError::None && r.left.enabled[2]);
+    r.motor.disable();r.workers();assert(r.motor.disabled());
   }
   { // Stop during a MIT transaction: do not send the next joint, turn off all.
     Rig r;r.home();auto t=r.target();unsigned seq=1;r.run(t,seq);
@@ -425,13 +639,12 @@ int main(int argc,char** argv) {
     c={};c.wheel_max_rpm=1600;assert(!validMotorConfig(c));
     c={};c.profile[0].kd=std::numeric_limits<float>::quiet_NaN();assert(!validMotorConfig(c));
   }
-  { // Measured driver limits on the real hips; configuration accepts the
-    // explicit .120 gain, matching the bench's capped .7 GUI request.
+  { // Gains from Lumi fit measured hip limits, while knee gains are independent.
     Rig r;r.left.gain_cap=r.right.gain_cap=120;
     r.motor.trip(MotorError::Bus);r.motor.resetFault();r.idle();r.home();
     auto t=r.target();unsigned seq=1;r.run(t,seq);
-    assert(signed16(r.left.last(2,0x1a),8)==120);
-    assert(signed16(r.right.last(3,0x1a),8)==120);
+    assert(signed16(r.left.last(2,0x1a),8)==36);
+    assert(signed16(r.right.last(3,0x1a),8)==50);
   }
   { // OFF stress test writes only wheel zero; it cannot enable or retain HOME.
     Rig r;r.home();assert(!r.motor.startOffTest(0));assert(r.motor.startOffTest(20));
@@ -502,7 +715,58 @@ int main(int argc,char** argv) {
       if(f[2]==1 && f[4]==3 && f[5]==0x20 && signed16(f,6)==0)zero=true;
     assert(zero);
   }
+  { // Direct-knee encoder must not move in model feedback when only hip moves.
+    Rig r;r.home();const auto initial=r.motor.feedback(r.now);
+    r.left.position[0]+=100;r.right.position[0]-=100;r.now+=4000;r.workers();
+    const auto f=r.motor.feedback(r.now);close(f.q[2],initial.q[2]);close(f.q[3],initial.q[3]);
+    assert(f.qd[0]>0 && f.qd[1]>0);close(f.qd[2],0);close(f.qd[3],0);
+    auto t=r.target();t.flags=2;MotorApplied a{};unsigned seq=1;a=r.run(t,seq);
+    close(a.target[2],f.q[0]+f.q[2]);close(a.target[3],f.q[1]+f.q[3]);
+  }
+  { // Legacy physical crank remains an explicit adapter option; HCR1 is identical.
+    BlMotorConfig c;c.knee_crank_coupling=1;c.sign={{{{1,-1,1}},{{-1,1,-1}}}};
+    Rig r(c);r.home();auto t=r.target();t.profile=HCR_RECOVERY;t.target[0]=t.target[1]=-.5F;
+    t.target[2]=t.target[3]=.6F;t.feedforward[0]=.1F;t.feedforward[2]=.3F;
+    unsigned seq=1;auto a=r.run(t,seq);
+    close(a.target[2],.6F);close(r.motor.feedback(r.now).q[2],1.1F);
+    assert(signed16(r.left.last(3,0x1a),12)==-4);
+  }
+  { // Correct a joint response level while OFF, verify level2 and MIT mode3.
+    std::uint64_t now=100000;Lock lock;BlMotorBackend motor(lock);FakeBus bus(now);
+    bus.response_level={1,1,1};BlMotorWorker worker(motor,0,bus);worker.step();
+    assert(motor.diagnostics().leg[0].configured);
+    assert(bus.response_level[0]==2 && bus.response_level[1]==2);
+    assert(bus.mode[0]==3 && bus.mode[1]==3 && !bus.wheel_write_replies);
+    for(auto on:bus.enabled)assert(!on);
+  }
+  { // An ACK without a latched configuration is rejected during disarmed setup.
+    std::uint64_t now=100000;Lock lock;BlMotorBackend motor(lock);FakeBus bus(now);
+    bus.ignore_config=true;BlMotorWorker worker(motor,0,bus);worker.step();
+    assert(motor.diagnostics().error==MotorError::Configuration);
+    assert(motor.diagnostics().leg[0].bus_error==BusError::ReadbackMismatch);
+  }
+  for (bool drop:{false,true}) { // Wheel no-write-reply mode must verify speed, not merely echo.
+    Rig r;r.left.response_level[2]=1;r.motor.trip(MotorError::Bus);assert(r.motor.resetFault());
+    r.idle();r.home();assert(!r.left.wheel_write_replies);
+    auto t=r.target();unsigned seq=1;r.run(t,seq);r.left.drop_speed_write=drop;t.target[4]=3;
+    if (!drop) {
+      auto a=r.run(t,++seq);close(a.target[4],3.036873F);
+      assert(r.motor.diagnostics().error==MotorError::None);
+    } else {
+      MotorApplied a{};r.motor.apply(t,++seq,r.now+20000,r.now,a);r.workers();
+      assert(r.motor.diagnostics().error==MotorError::Configuration && r.motor.disabled());
+    }
+  }
+  { // An ignored wheel enable cannot be mistaken for applied torque enable.
+    Rig r;r.home();r.left.ignore_enable=true;auto t=r.target();MotorApplied a{};
+    r.motor.apply(t,1,r.now+20000,r.now,a);r.workers();
+    assert(r.motor.diagnostics().error==MotorError::Configuration && r.motor.disabled());
+  }
+  { BlMotorConfig c;c.knee_crank_coupling=.5F;assert(!validMotorConfig(c));
+    c={};c.knee_profile[1].kd=std::numeric_limits<float>::quiet_NaN();assert(!validMotorConfig(c));
+  }
+  std::puts("PASS: Lumi mapping/gains, direct-knee and crank adapters, verified configuration/enable, no-write-reply wheel");
   std::puts("PASS: bounded retry, first failure retained, cancellation/expiry and wheel dedup/keepalive/freshness");
   gatewayIntegration();
-  std::puts("PASS: golden codec, calibrated side/sign/units, crank FF, quantized applied targets, startup, both-bus ACK, unwrap/freshness, range, expiry, cancellation, write/enable loss, reset, gain/status/CRC faults");
+  std::puts("PASS: golden codec, calibrated side/sign/units, physical joint FF, quantized applied targets, startup, both-bus ACK, unwrap/freshness, range, expiry, cancellation, write/enable loss, reset, gain/status/CRC faults");
 }

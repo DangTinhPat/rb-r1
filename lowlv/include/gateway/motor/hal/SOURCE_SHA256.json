@@ -1,0 +1,7 @@
+{
+  "firmware/hal/include/rb1/hal/MotorFrameCodec.hpp": "5f986b3c9a804f77975c435e0e6bbf640720d69aee852a7480d162c0def8da8f",
+  "firmware/hal/include/rb1/hal/MotorMapping.hpp": "aeb469b5de657f9e95c6b5bfe22e0307028fca599c81a2677131206f6e72de10",
+  "firmware/control/include/rb1/control/board/BoardConfig.hpp": "9f419be380523b81528b3f149e6a56a0cae88f840d7fa4ffa7853c49fe99149c",
+  "firmware/esp32/src/Esp32Bus.cpp": "d789da5ad3aa84f6871d95682b31eba09d7cd3bc764d80c63dd92468a528e8c8",
+  "firmware/hal/tests/motor_frame_codec_tests.cpp": "1465435029b82df9044e0dc207a47e288694a3e8425561c4314b21aafad36f9d"
+}

@@ -1,0 +1,21 @@
+{
+  "firmware/CMakeLists.txt": "9dc8c5ca667b79f31443ce696d2975431d2e12432208ba3d4f6cbd4b6e830605",
+  "firmware/platformio.ini": "5e9df297ad0cf0e79a79ab9c9d6e5b6c8cbf89eb141799c0e90b991d851c9e0b",
+  "firmware/partitions_ota.csv": "4a6aaf11525dab5d49a336aa52ef7e65f8e83d824c9a7a931c72943cbd40d63c",
+  "firmware/sdkconfig.defaults": "60f7b28c242326425e31ab761cb01d6297fd02a6f00f365881a7946730c8559b",
+  "tests/check_motor_bus.py": "73e1c6a2a408be6e27b9aac745feb1890999515139cb5fed8bf12eb418630bf1",
+  "tools/ota_upload.py": "6afd4d3804885874db5ba656e9fcf9798fec2f1fd9108fc817d72086a2ed1775",
+  "docs/PROTOCOL_ERRATA.md": "21076586e58b1816f8970669a7f9144ead106cb7105fde3190cc54049605a5fc",
+  "firmware/src/CMakeLists.txt": "172ec7eef7642d1ec0d83491fae7482b302a0c87705d80bd955de6fc67124627",
+  "firmware/src/app/main.c": "a6bbed9a789c858a4c13dae2ccc491d689058b24be9647fab8f6ab92069b47c5",
+  "firmware/src/libs/joint_bus/joint_bus.c": "b32519f2bb51fd4e740fca3133a063662e1b20be1dc1fa4f2b2a3a43cde165bc",
+  "firmware/src/libs/joint_bus/CMakeLists.txt": "dc5ab50a3e1833a0543281aa0d6c2301bac797e9fc882644ecb5818f71e4da93",
+  "firmware/src/libs/leg/leg.c": "91ec9f10ce03ab77458a22628eb74fa4dcaf479aab5f484154383d80e3fcf6d6",
+  "firmware/src/libs/leg/CMakeLists.txt": "e81c23f2851873a98adcbff60fb330b3d9223a6457296cf11fdf0bec71076ece",
+  "firmware/src/libs/bench_net/bench_net.c": "70cbb2e4bbd5aaf01b49a56d15b01afac60d2ad17f969c2131227c129379edbb",
+  "firmware/src/libs/bench_net/CMakeLists.txt": "a92681d94017f2e8e9eef045e2d8ccb3f4976e40e864492d8c487c5b0e705c2a",
+  "firmware/src/libs/bench_net/bench_secrets.example.h": "cb5c9894a4b01b17e99b47013586bb4b569e2fbe67a32377ef3f02aa45aa7119",
+  "firmware/src/libs/joint_bus/include/joint_bus.h": "fe5dabe044bbd59f1ede07addac11f9ad24a969c30e6d083b4308c88f79a0edc",
+  "firmware/src/libs/leg/include/leg.h": "06b3bdc316591e55bf962ccd092ddaa029590b371f0587dc98d92ee864ead0c2",
+  "firmware/src/libs/bench_net/include/bench_net.h": "fdcf207da9d5133513a51d70a834ddeaf2644fbd59235f86cae2be8ac6818ac0"
+}

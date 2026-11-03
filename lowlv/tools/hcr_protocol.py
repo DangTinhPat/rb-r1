@@ -10,6 +10,10 @@ HEADER = struct.Struct('<2sBBHHIQ')
 CRC = struct.Struct('<I')
 MAX_PAYLOAD = 256
 HELLO, HELLO_ACK, TELEMETRY, TARGET, STATUS = 1, 2, 3, 0x81, 0x82
+ENCODER_HOME, ENCODER_HOME_ACK = 0x83, 5
+ENCODER_HOME_DATA = struct.Struct('<II')  # epoch, source telemetry sequence
+ENCODER_HOME_ACK_DATA = struct.Struct('<III')  # epoch, request sequence, result
+HOME_APPLIED, HOME_NOT_OFF, HOME_FEEDBACK, HOME_REFUSED = 1, 2, 3, 4
 HELLO_DATA = struct.Struct('<IHHI')
 SCHEMA = 0x31524348  # HCR1, fixed interface identifier
 TELEMETRY_DATA = struct.Struct('<III29f')
@@ -19,6 +23,27 @@ IMU_OK, ENCODER_OK, CALIBRATED, ESTOP = 1, 2, 4, 8
 TORQUE_VALID, TARGET_VALID, DRIVER_FAULT = 16, 32, 64
 DISABLED, HOME_PD, RECOVERY, POLICY_PD = 0, 1, 2, 3
 LEGS_ENABLE, WHEELS_ENABLE = 1, 2
+
+
+# Optional MCU diagnostics, 10 Hz. Never telemetry/source history or an ACK.
+EXECUTION_DIAG = 6
+EXECUTION_DIAG_VERSION = 1
+EXECUTION_DIAG_DATA = struct.Struct('<24I')
+EXECUTION_DIAG_FIELDS = (
+    'epoch', 'version', 'local_fault', 'motor_error',
+    'link_rx_age_us', 'target_rx_age_us', 'pending_age_us', 'pending_seq',
+    'superseded', 'cycle_l_us', 'cycle_r_us', 'io_l_us',
+    'io_r_us', 'cycle_l_max_us', 'cycle_r_max_us', 'io_l_max_us',
+    'io_r_max_us', 'error_l', 'error_r', 'stage_l',
+    'stage_r', 'flags', 'rx_queue_max_us', 'applied_latency_max_us',
+)
+
+
+def decode_execution_diagnostics(payload):
+    values = EXECUTION_DIAG_DATA.unpack(payload)
+    if values[1] != EXECUTION_DIAG_VERSION:
+        raise ValueError('unsupported execution diagnostics version')
+    return dict(zip(EXECUTION_DIAG_FIELDS, values))
 
 
 @dataclass

@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="vi"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RB-R1 · Motor bench</title>
+<style>
+:root{color-scheme:dark;font:15px system-ui;background:#111824;color:#e6edf6}body{max-width:1220px;margin:28px auto;padding:0 20px}header{display:flex;align-items:center;justify-content:space-between;gap:20px}h1{font-size:26px;margin-bottom:8px}h2{font-size:19px}h3{margin:0}p{color:#b8c6d9;line-height:1.6}.bar,.card{background:#1a2535;border:1px solid #344459;border-radius:10px;padding:16px}.bar{margin:18px 0;display:flex;gap:12px;align-items:center;flex-wrap:wrap}button,input{font:inherit;border:1px solid #52667e;border-radius:6px;padding:9px;background:#26384e;color:inherit}button{cursor:pointer}button:hover{background:#37536e}button:disabled{opacity:.35;cursor:default}button.on{background:#185d56}button.stop{background:#ad313c;border-color:#e4767e;font-weight:700;font-size:18px}input{width:72px;background:#111c2a}label{font-size:13px;color:#b8c6d9;display:inline-block;margin:8px 7px 8px 0}.legs{display:grid;grid-template-columns:1fr 1fr;gap:20px}.motors{display:grid;gap:12px}.row{display:flex;justify-content:space-between;gap:12px;align-items:center}.read{display:grid;grid-template-columns:1fr 1fr;gap:6px;font-variant-numeric:tabular-nums;margin:14px 0}.read span{color:#9fb1c8}.badge{font-size:12px;border-radius:5px;padding:4px 8px;background:#344459}.good{color:#6de0bf}.bad{color:#ff9aa6}pre{white-space:pre-wrap;max-height:220px;overflow:auto;font-size:12px;line-height:1.6}#message{min-height:24px;color:#ffd28b}small{color:#a4b5ca}.jog{touch-action:none;user-select:none}@media(max-width:760px){.legs{grid-template-columns:1fr}header{align-items:flex-start;flex-direction:column}}
+</style>
+<header><div><h1>RB-R1 · Kiểm tra motor</h1><p>GUI trên LF → UART → ESP → hai bus motor</p></div><button class="stop" id="stop">STOP · TẮT TẤT CẢ</button></header>
+<div class="bar"><button id="connect">Kết nối GUI</button><span id="link">Đang chờ ESP…</span><span id="safety">FAULT</span><span id="online">Online —/6</span><span id="home">HOME 0/6</span></div>
+<p><span id="view">Hiển thị: đang kết nối…</span> · <span id="control">Điều khiển: chưa kết nối</span></p>
+<div class="bar"><button id="reset">1. RESET lỗi</button><button id="capture">2. MOTOR_HOME</button><small>HOME chụp tư thế hiện tại khi cả 6 motor OFF, không làm motor chuyển động.</small></div>
+<div id="message" role="status"></div><p id="reason"></p><p id="ack">Chưa gửi lệnh · ACK ESP sẽ hiện ở đây</p>
+<div class="legs"><section><h2>Chân phải · UART1 / GPIO17</h2><div class="motors" id="right"></div></section><section><h2>Chân trái · UART2 / GPIO15</h2><div class="motors" id="left"></div></section></div>
+<p>Góc hiển thị theo encoder driver; ID3 là crank, không phải góc knee đã đổi tọa độ. “ON yêu cầu” là trạng thái worker ESP; OFF xác nhận dựa trên đọc lại thanh ghi torque. QUEUED xác nhận nhận lệnh, chưa xác nhận motor đã áp dụng.</p>
+<details open><summary>UART, ACK và lỗi bus</summary><p id="bus">Chưa có telemetry</p><pre id="logs"></pre></details>
+<script>
+'use strict';
+const $=id=>document.getElementById(id), token=location.hash.slice(1);
+const newClient=()=>Array.from(crypto.getRandomValues(new Uint32Array(4))).join('-');
+let client=newClient();
+let controlling=false, connecting=false, sessionVersion=0, state={}, requestBusy=false, viewFresh=false;
+const heartbeat=new Worker('/heartbeat.js');
+heartbeat.onmessage=e=>{if(e.data.type==='lost'&&controlling)stop(e.data.reason);};
+function message(text){$('message').textContent=text;}
+function controlStatus(){ $('control').textContent=controlling?'Điều khiển: đang giữ phiên':'Điều khiển: chưa kết nối'; }
+function disableCommands(){
+ for(const b of document.querySelectorAll('.motion'))b.disabled=true;
+ $('reset').disabled=true;$('capture').disabled=true;
+}
+async function api(path,body){
+ const r=await fetch('/api/'+path,{method:body?'POST':'GET',headers:{'X-Bench-Token':token,'X-Bench-Client':client,...(body?{'Content-Type':'application/json'}:{})},body:body?JSON.stringify({client,...body}):undefined,signal:AbortSignal.timeout(1000)});
+ const j=await r.json(); if(!r.ok)throw Error(j.error||r.status);return j;
+}
+async function command(cmd,reason){try{if(cmd!=='STOP'&&!viewFresh)throw Error('Dữ liệu hiển thị cũ; chờ kết nối lại trước khi gửi lệnh');await api('command',{command:cmd,reason});message('LF đã xếp lệnh: '+cmd+' · xem ACK ESP bên dưới');}catch(e){message(e.message);}}
+async function stop(reason='Bấm STOP trên GUI'){sessionVersion++;controlling=false;controlStatus();disableCommands();heartbeat.postMessage({type:'stop'});await command('STOP',reason);message(reason+' · cần Kết nối → RESET → HOME lại');}
+$('stop').onclick=()=>stop();
+$('connect').onclick=async()=>{
+ if(connecting)return;
+ connecting=true;client=newClient();const version=++sessionVersion;
+ try{const s=await api('connect',{});if(version!==sessionVersion)return;controlling=true;heartbeat.postMessage({type:'start',token,client});state=s;render(s);message('GUI đã giữ quyền điều khiển. RESET → MOTOR_HOME → bật từng motor.');}
+ catch(e){if(version===sessionVersion){controlling=false;message(e.message);}}
+ finally{connecting=false;}
+};
+$('reset').onclick=()=>command('RESET');$('capture').onclick=()=>command('MOTOR_HOME');
+const names=['Bánh xe','Crank','Đùi / hip'], ids=[1,3,2];
+for(const m of [2,1,0,5,4,3]){
+ const joint=m%3, wheel=joint===0, card=document.createElement('article');card.className='card';
+ card.innerHTML=`<div class="row"><h3>${names[joint]} · ID${ids[joint]}</h3><b class="badge" id="status${m}">OFFLINE</b></div>
+ <div class="read"><div><span>Góc </span><b id="pos${m}">—</b> °</div><div><span>Tốc độ </span><b id="vel${m}">—</b> rpm</div><div><span>Target </span><b id="tgt${m}">—</b> ${wheel?'rpm':'°'}</div><div><span>Miss / status </span><b id="miss${m}">—</b></div></div>
+ <div><button class="on motion" id="on${m}">Bật motor</button> <button class="motion" id="off${m}">Tắt motor</button></div>
+ ${wheel?`<label>Tốc độ ±950 rpm <input id="rpm${m}" type="number" value="30" min="-950" max="950" step="1"></label><button class="motion" id="speed${m}">Đặt tốc độ</button> <button class="motion" id="zero${m}">0 rpm</button>`:
+ `<label>Tốc độ rpm <input id="rpm${m}" type="number" value="3" min="0.1" max="30" step="0.1"></label><label>Bước ° <input id="step${m}" type="number" value="5" min="0.1" max="360" step="0.1"></label><div><button class="motion" id="minus${m}">− Bước</button> <button class="motion" id="plus${m}">+ Bước</button> <button class="motion jog" id="back${m}">Jog 0,3 s: duỗi −</button> <button class="motion jog" id="forward${m}">Jog 0,3 s: gập +</button></div><div><label>Kp <input id="kp${m}" type="number" value="10" min="0" max="65.535" step="0.1"></label><label>Kd <input id="kd${m}" type="number" value="0.036" min="0" max="65.535" step="0.001"></label><button class="motion" id="gain${m}">Đặt gains</button><small id="actual${m}"></small></div>`}`;
+ $(m<3?'right':'left').appendChild(card);
+ $('on'+m).onclick=()=>command('ON '+(1<<m));$('off'+m).onclick=()=>command('OFF '+(1<<m));
+ if(wheel){$('speed'+m).onclick=()=>command(`W ${m} ${$('rpm'+m).value}`);$('zero'+m).onclick=()=>command(`W ${m} 0`);}
+ else{
+  for(const [suffix,sign] of [['minus',-1],['plus',1]])$(suffix+m).onclick=()=>command(`MOVE ${m} ${sign*Number($('step'+m).value)} ${$('rpm'+m).value}`);
+  $('gain'+m).onclick=()=>command(`G ${m} ${$('kp'+m).value} ${$('kd'+m).value}`);
+  for(const [suffix,dir] of [['back',-1],['forward',1]]){
+   $(suffix+m).onclick=()=>command(`JOG ${m} ${dir} ${$('rpm'+m).value}`);
+  }
+ }
+}
+window.addEventListener('blur',()=>{if(controlling)stop('Cửa sổ GUI mất focus → STOP');});
+document.addEventListener('visibilitychange',()=>{if(document.hidden&&controlling)stop('Trang GUI bị ẩn → STOP');});
+window.addEventListener('pagehide',()=>{fetch('/api/command',{method:'POST',keepalive:true,headers:{'Content-Type':'application/json','X-Bench-Token':token},body:JSON.stringify({client,command:'STOP'})});});
+function render(s){
+ viewFresh=true;$('view').textContent='Hiển thị: dữ liệu mới';$('view').className='good';controlStatus();
+ $('link').textContent=s.connected?(controlling?'UART OK · GUI đang điều khiển':'UART OK · GUI chưa kết nối'):'Mất / chưa có UART motor bench';$('link').className=s.connected?'good':'bad';
+ $('safety').textContent=s.fault?'FAULT · cần RESET':'Lease OK';$('safety').className=s.fault?'bad':'good';
+ $('online').textContent='Online '+(s.connected?s.online_count:0)+'/6';
+ $('reason').textContent=s.fault?'Đang khóa motor · '+(s.stop_reason||'Cần RESET; xem ACK ESP'):'Đang giữ heartbeat UART';
+ $('ack').textContent='ACK ESP: '+(s.ack||'chưa có')+' · Đã gửi '+s.commands_sent+' / nhận ACK '+s.acks_received;
+ $('home').textContent='HOME '+s.homed.toString(2).replaceAll('0','').length+'/6';
+ $('reset').disabled=!controlling||s.off!==63;$('capture').disabled=!controlling||s.fault||s.off!==63;
+ for(const b of document.querySelectorAll('.motion'))b.disabled=!controlling||!s.connected||s.fault;
+ for(let m=0;m<6;m++){
+  const v=s.motors[m];$('on'+m).disabled=!controlling||!s.connected||s.fault||s.homed!==63||!v?.online;
+  if(!v)continue;
+  $('status'+m).textContent=!s.connected?'DỮ LIỆU CŨ':!v.online?'OFFLINE':v.on?'ON yêu cầu':(s.off&(1<<m))?'OFF xác nhận':'OFF chưa xác nhận';
+  $('status'+m).className='badge '+(s.connected&&v.online?'good':'bad');
+  for(const [field,id] of [['pos','pos'],['vel','vel'],['tgt','tgt']])$(id+m).textContent=v[field].toFixed(1);
+  $('miss'+m).textContent=v.miss+' / 0x'+v.status.toString(16).padStart(2,'0');
+  const g=s.gains[String(m)];if(g&&m%3!==0)$('actual'+m).textContent=` Thực tế ${g[0]} / ${g[1]} · max ${g[2]} / ${g[3]}`;
+ }
+ $('bus').textContent=s.counters.length?`Chu kỳ phải/trái: ${s.counters[0]} / ${s.counters[1]} µs · Lỗi bus: ${s.counters[2]} / ${s.counters[3]} · Telemetry: ${s.age_ms} ms`:'Chưa có telemetry';
+ $('logs').textContent=s.logs.join('\n');if(s.error)message(s.error);
+}
+async function tick(){
+ if(requestBusy||connecting)return;requestBusy=true;
+ const version=sessionVersion;
+ try{
+  const s=await api('state');
+  // A response issued before Connect/STOP must not overwrite the new session.
+  if(version!==sessionVersion)return;
+  state=s;
+  if(controlling&&!state.controlling){sessionVersion++;controlling=false;heartbeat.postMessage({type:'stop'});message('Quyền điều khiển hết hạn. Kết nối → RESET → HOME lại.');}
+  render(state);
+ }
+ catch(e){if(version===sessionVersion){
+  // Display polling is not the control lease. The worker and LF enforce that
+  // independently; a failed GET must not close a healthy heartbeat stream.
+  viewFresh=false;disableCommands();$('view').textContent='Hiển thị: dữ liệu cũ · đang kết nối lại…';$('view').className='bad';
+  message('Chưa đọc được trạng thái: '+e.message+' · tự thử lại; không gửi lại lệnh motor');
+ }}
+ finally{requestBusy=false;}
+}
+if(!token)message('Hãy mở đúng URL có token mà server.py in ra.');tick();setInterval(tick,200);
+</script></html>

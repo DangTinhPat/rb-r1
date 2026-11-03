@@ -35,7 +35,9 @@ StandUp::Input RecoveryController::recoveryInput(const Input &raw) const {
   si.hip_jacobian = capture.d_hip;
   si.hip_measured_rad = hip_meas_;
   si.hip_measured_rate_rad_s = hip_rate_meas_;
-  si.knee_measured_rad = knee_meas_;
+  si.knee_measured_rate_rad_s = knee_rate_meas_;
+  // Match the source trajectory: do not let the average hide a lagging knee.
+  si.knee_measured_rad = std::min(raw.knee_rad[0], raw.knee_rad[1]);
   si.wheel_measured_rad_s = raw.wheel_rad_s;
   si.carrier_rate_rad_s = raw.pitch_rate_rad_s + hip_rate_meas_ + knee_rate_meas_;
   si.ground_speed_m_s = ground_v_;

@@ -2,7 +2,22 @@
 #include <stdio.h>
 #include <assert.h>
 int main(int argc, char **argv) {
-  (void)argv;
+  if (argc > 1 && strcmp(argv[1], "diagnostics") == 0) {
+    uint8_t b[280]; uint32_t values[HCR_EXECUTION_DIAG_WORDS];
+    for(unsigned i=0;i<HCR_EXECUTION_DIAG_WORDS;++i) values[i]=i;
+    values[0]=7; values[1]=HCR_EXECUTION_DIAG_VERSION;
+    size_t n=hcr_execution_diagnostics(b,sizeof b,9,123456,values);
+    return fwrite(b,1,n,stdout)==n ? 0 : 1;
+  }
+  if (argc > 1 && strcmp(argv[1], "home") == 0) {
+    uint8_t b[280], payload[12];
+    hcr_put32(payload, 7); hcr_put32(payload+4, 1);
+    size_t n = hcr_encode(b, sizeof b, HCR_ENCODER_HOME, 3, 3, payload, 8);
+    if (fwrite(b, 1, n, stdout) != n) return 1;
+    hcr_put32(payload+4, 3); hcr_put32(payload+8, HCR_HOME_APPLIED);
+    n = hcr_encode(b, sizeof b, HCR_ENCODER_HOME_ACK, 2, 100001, payload, 12);
+    return fwrite(b, 1, n, stdout) == n ? 0 : 1;
+  }
   if (argc > 1) {
     uint8_t b[280];
     size_t n = hcr_hello_ack(b, sizeof b, 42, 123456, 0x10203040);

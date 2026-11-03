@@ -116,7 +116,7 @@ void service(void*) {
   if (esp_timer_start_periodic(service_timer, 500) != ESP_OK) {
     core.stop(LocalFault::Transport); vTaskDelete(nullptr); return;
   }
-  std::uint64_t next_telemetry = 0, next_hello = 0, next_report = 0;
+  std::uint64_t next_telemetry = 0, next_hello = 0, next_report = 0, next_execution_diag = 0;
   ImuObservation imu{};
   Report report{}; report.imu_id = imu_driver.whoAmI();
   for (;;) {
@@ -175,6 +175,11 @@ void service(void*) {
     }
     if (due(now, next_telemetry, 5000)) {
       queuePacket(core.telemetry(now));
+    }
+    if (due(now, next_execution_diag, 100000) && uxQueueSpacesAvailable(tx_queue)>1) {
+      // Optional diagnostics may be skipped; leave space for control traffic.
+      const auto packet=core.executionDiagnostics(now);
+      if (packet.size) (void)xQueueSend(tx_queue,&packet,0);
     }
     const auto duration = static_cast<std::uint32_t>(esp_timer_get_time()-now);
     if (duration > report.service_max_us) report.service_max_us = duration;
@@ -291,6 +296,19 @@ void status() {
       latest_report.service_max_us, latest_report.missed_ticks,
       latest_report.command_op, latest_report.command_result);
   printLine(line);
+  if (s.sensor_fault.at_us) {
+    const auto& f=s.sensor_fault;
+    const auto sample_age=[&](std::uint64_t stamp) -> unsigned long long {
+      return !stamp || stamp>f.at_us ? UINT64_MAX : f.at_us-stamp;
+    };
+    std::snprintf(line,sizeof line,
+        "SENSOR_FAULT at_us=%llu flags=0x%02x imu_age_us=%llu encoder_age_us=%llu "
+        "motor_ready=%d encoders_valid=%d homed=%d\n",
+        static_cast<unsigned long long>(f.at_us),f.flags,
+        sample_age(f.imu_stamp_us),sample_age(f.encoder_stamp_us),
+        f.motor_ready,f.encoders_valid,f.homed);
+    printLine(line);
+  }
   const auto* running = esp_ota_get_running_partition();
   const auto* next = esp_ota_get_next_update_partition(nullptr);
   char elf_hash[65]{};
@@ -346,6 +364,16 @@ void status() {
       side?"R":"L",static_cast<unsigned>(m.error),m.failed_id,m.failed_instruction,m.failed_address,
       static_cast<unsigned>(m.bus_error),m.recovered_writes,m.torque_enable[0],m.torque_enable[1],m.torque_enable[2],m.startup_wheel_goal_rpm);
     printLine(line);
+    if (m.error!=MotorError::None) {
+      const auto& f=m.fault_context;
+      std::snprintf(line,sizeof line,
+        "MOTOR_FAULT side=%s error=%u during_io=%u expired_lease=%u expired_batch=%u id=%u inst=0x%02x addr=0x%02x bus_stage=%u at_us=%llu lease_us=%llu batch_deadline_us=%llu batch_seq=%u tx_us=%u echo_us=%u total_us=%u echo_bytes=%u reply_bytes=%u expected=%u\n",
+        side?"R":"L",static_cast<unsigned>(m.error),f.during_io,f.expired_lease,f.expired_batch,f.id,f.instruction,f.address,
+        static_cast<unsigned>(f.bus_error),static_cast<unsigned long long>(f.at_us),
+        static_cast<unsigned long long>(f.lease_us),static_cast<unsigned long long>(f.batch_deadline_us),
+        f.batch_seq,f.trace.tx_us,f.trace.echo_us,f.trace.total_us,f.trace.echo_count,f.trace.rx_count,f.trace.expected);
+      printLine(line);
+    }
     std::snprintf(line,sizeof line,
       "FEEDBACK_DIAG side=%s reason=%u id=%u previous=%ld received=%ld gap_us=%llu wheel_gap_max_us=%llu active=%d\n",
       side?"R":"L",static_cast<unsigned>(m.feedback_error),m.feedback_id,
@@ -473,7 +501,10 @@ void pumpUart() {
     if (!pending.size && xQueueReceive(tx_queue, &pending, 0) != pdTRUE) break;
     const auto now = static_cast<std::uint64_t>(esp_timer_get_time());
     if (now-hcr_u64(pending.bytes.data()+12) > 10000 && offset == 0) {
-      pending = {}; transport_fault.store(true); ++queue_errors; ++stale_tx; continue;
+      const bool optional=pending.bytes[3]==HCR_EXECUTION_DIAG;
+      pending = {};
+      if (!optional) { transport_fault.store(true); ++queue_errors; ++stale_tx; }
+      continue;
     }
     const int count = uart_tx_chars(kLfUart, reinterpret_cast<const char*>(pending.bytes.data()+offset),
                                      pending.size-offset);

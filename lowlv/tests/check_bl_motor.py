@@ -21,6 +21,12 @@ def main():
                         str(ROOT/'tests/bl_motor_tests.cpp'),
                         '-o',str(binary)],check=True)
         subprocess.run([str(binary)],check=True)
+        codec = Path(directory)/'lumi-codec-tests'
+        subprocess.run(['g++', '-std=c++17', '-Wall', '-Wextra', '-Werror', '-O1', '-g',
+                        '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
+                        '-I'+str(ROOT/'include'), str(ROOT/'tests/lumi_motor_frame_tests.cpp'),
+                        '-o',str(codec)],check=True)
+        subprocess.run([str(codec)],check=True)
         if args.runtime:
             check_interop(binary,args.runtime.resolve(),absent_cases=(False,))
             print("PASS: LF Core + actual BL motor backend/codec, two mock driver buses, 2700 cycles")

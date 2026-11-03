@@ -24,7 +24,8 @@ void GatewayCore::stop(LocalFault reason) noexcept {
 void GatewayCore::newSession(std::uint32_t epoch) noexcept {
   stop();
   epoch_ = epoch; tx_seq_ = rx_seq_ = applied_seq_ = target_seq_ = 0;
-  rx_stamp_ = deadline_ = 0;
+  rx_stamp_ = deadline_ = last_target_rx_us_ = 0;
+  rx_queue_max_us_ = 0;
   connected_ = true; have_rx_ = reset_pending_ = false;
   // Reconnection may clear transport/session faults, never a local E-stop or
   // driver fault. Those require an explicit CLEAR_FAULT after verified OFF.
@@ -69,7 +70,14 @@ void GatewayCore::tick(std::uint64_t now) noexcept {
   feedback_ = motor_.feedback(now);
   if (feedback_.estop) stop(LocalFault::Estop);
   if (feedback_.driver_fault) stop(LocalFault::Driver);
-  if (armed_ && (!motor_.ready() || !freshSensors(now))) stop(LocalFault::Sensors);
+  if (armed_) {
+    const bool ready=motor_.ready();
+    if (!ready || !freshSensors(now)) {
+      sensor_fault_={now,imu_.stamp_us,feedback_.stamp_us,flags(now),ready,
+                     feedback_.encoders_valid,feedback_.homed};
+      stop(LocalFault::Sensors);
+    }
+  }
   last_tick_ = now;
   if (!enabled_) {
     if (disable_ack_pending_ && motor_.disabled()) {
@@ -107,6 +115,8 @@ WirePacket GatewayCore::receive(const HcrFrame& f, std::uint64_t now,
   if (maintenance_) { ++rejected_; return reply; }
   if (enabled_ && now >= deadline_) stop(LocalFault::TargetTimeout);
   if (!received_us) received_us = now;
+  if (received_us <= now) rx_queue_max_us_ = std::max(rx_queue_max_us_,
+      static_cast<std::uint32_t>(std::min<std::uint64_t>(now-received_us,UINT32_MAX)));
   if (received_us > now || now-received_us >= HCR_TARGET_TTL_US) {
     ++rejected_; return reply;
   }
@@ -137,6 +147,31 @@ WirePacket GatewayCore::receive(const HcrFrame& f, std::uint64_t now,
     else if (remote_mode_ <= 1) stop();
     return reply;
   }
+  if (f.type == HCR_ENCODER_HOME && f.size == 8) {
+    std::uint32_t result=HCR_HOME_REFUSED;
+    if (armed_ || enabled_ || !motor_.disabled() || (remote_mode_>1 && remote_mode_!=6))
+      result=HCR_HOME_NOT_OFF;
+    else if ((fault_!=LocalFault::None && fault_!=LocalFault::RemoteFault) ||
+             (remote_mode_==6 && remote_fault_!=2))
+      result=HCR_HOME_REFUSED;
+    else if (!sourceValid(hcr_u32(f.payload+4),now))
+      result=HCR_HOME_FEEDBACK;
+    else {
+      // Canonical model home; the operator has manually placed the legs there.
+      // captureHome performs no bus write, torque enable or movement.
+      constexpr std::array<float,4> home{{2.35706715F,2.35706715F,0,0}};
+      result=motor_.captureHome(home,now)?HCR_HOME_APPLIED:HCR_HOME_REFUSED;
+      if (result==HCR_HOME_APPLIED) {
+        feedback_=motor_.feedback(now); applied_valid_=false;
+      }
+    }
+    rx_seq_=f.seq; rx_stamp_=f.stamp_us; have_rx_=true; last_rx_us_=now;
+    std::uint8_t payload[12]{};
+    hcr_put32(payload,epoch_); hcr_put32(payload+4,f.seq); hcr_put32(payload+8,result);
+    reply.size=hcr_encode(reply.bytes.data(),reply.bytes.size(),HCR_ENCODER_HOME_ACK,
+                          tx_seq_++,now,payload,sizeof payload);
+    return reply; // never refresh TARGET deadline, clear faults or ARM
+  }
   HcrTarget target{};
   if (!hcr_target(&f, &target) ||
       (target.profile == HCR_DISABLED && target.flags != 0)) {
@@ -156,6 +191,7 @@ WirePacket GatewayCore::receive(const HcrFrame& f, std::uint64_t now,
   }
   rx_seq_ = f.seq; rx_stamp_ = f.stamp_us; have_rx_ = true;
   last_rx_us_ = now;
+  last_target_rx_us_ = received_us;
   ++rx_targets_;
   if (target.profile == HCR_DISABLED) {
     motor_.disable(); enabled_ = applied_valid_ = false;
@@ -184,7 +220,7 @@ WirePacket GatewayCore::requestSession(std::uint64_t now) noexcept {
 bool GatewayCore::clearLocalFault() noexcept {
   if (armed_ || enabled_ || !motor_.disabled() || feedback_.estop) return false;
   if (!motor_.resetFault()) return false;
-  fault_=LocalFault::None; reset_pending_=false; return true;
+  fault_=LocalFault::None; sensor_fault_={}; reset_pending_=false; return true;
 }
 
 WirePacket GatewayCore::telemetry(std::uint64_t now) noexcept {
@@ -215,8 +251,27 @@ WirePacket GatewayCore::telemetry(std::uint64_t now) noexcept {
   return out;
 }
 
+WirePacket GatewayCore::executionDiagnostics(std::uint64_t now) noexcept {
+  WirePacket out{};
+  if (maintenance_ || !connected_ || reset_pending_) return out;
+  const auto d=motor_.executionStats(now);
+  const auto age=[now](std::uint64_t stamp) -> std::uint32_t {
+    return !stamp || now<stamp ? UINT32_MAX :
+      static_cast<std::uint32_t>(std::min<std::uint64_t>(now-stamp,UINT32_MAX));
+  };
+  const std::uint32_t values[HCR_EXECUTION_DIAG_WORDS]={
+    epoch_,HCR_EXECUTION_DIAG_VERSION,static_cast<std::uint32_t>(fault_),d.error,
+    age(last_rx_us_),age(last_target_rx_us_),d.pending_age_us,d.pending_seq,d.superseded,
+    d.cycle_us[0],d.cycle_us[1],d.io_us[0],d.io_us[1],
+    d.cycle_max_us[0],d.cycle_max_us[1],d.io_max_us[0],d.io_max_us[1],
+    d.bus_error[0],d.bus_error[1],d.bus_stage[0],d.bus_stage[1],
+    d.batch_flags | (d.supported?0x80000000U:0U),rx_queue_max_us_,d.applied_latency_max_us};
+  out.size=hcr_execution_diagnostics(out.bytes.data(),out.bytes.size(),tx_seq_++,now,values);
+  return out;
+}
+
 Diagnostics GatewayCore::diagnostics(std::uint64_t now) const noexcept {
   return {epoch_,rx_targets_,rejected_,applied_seq_,remote_mode_,remote_fault_,flags(now),
-          fault_,connected_ && !reset_pending_,armed_,enabled_,motor_.ready()};
+          fault_,connected_ && !reset_pending_,armed_,enabled_,motor_.ready(),sensor_fault_};
 }
 }  // namespace gateway
