@@ -1,7 +1,7 @@
 # HCR1 — Giao thức Luckfox ↔ MCU
 
 HCR1 truyền telemetry từ MCU lên runtime và reference từ runtime xuống MCU.
-Luckfox chạy recovery/policy; MCU đọc cảm biến, homing và thực thi reference.
+Luckfox chạy kế hoạch gập và policy; MCU đọc cảm biến, homing và thực thi reference.
 Codec Python: `src/rb_runtime/protocol.py`. Codec C đối chiếu:
 `protocol/include/hcr_protocol.h`. Firmware MCU là project riêng.
 
@@ -124,7 +124,7 @@ Nếu driver đo crank (`coupling=1`) thì dùng phi/phi_dot trực tiếp như 
 |---:|---|
 | 0 DISABLED | Bỏ enable; payload 0 không yêu cầu chạy motor về góc 0 |
 | 1 HOME_PD | Giữ home |
-| 2 RECOVERY | Reference đứng dậy/Support và velocity FF |
+| 2 RECOVERY | Reference gập (fold) và velocity FF |
 | 3 POLICY_PD | Reference giải mã từ policy; FF = 0 |
 
 MCU chỉ nhận frame CRC đúng, đúng epoch, sequence mới, float finite, profile
@@ -132,8 +132,7 @@ hợp lệ và source sample đã phát còn mới <=30 ms. TTL TARGET **20 ms**
 Frame replay/cũ hoặc STATUS không gia hạn TTL. Watchdog motor phải chạy độc lập
 với task UART và LF. Lỗi/timeout không tự re-enable khi có gói mới.
 
-Recovery helper hiện không có FIFO wheel delay50ms (đã bỏ khi đồng bộ Lumi).
-Filter reference recovery tau=0,075s thuộc tầng áp dụng phía dưới;
+Filter reference tau=0,075s thuộc tầng áp dụng phía dưới;
 applied_target phải phản ánh reference sau filter.
 Đáp ứng/gain driver thật cần kiểm riêng, không suy ra từ payload HCR1.
 
@@ -149,7 +148,7 @@ Mode: 0 WAIT_LINK, 1 DISARMED, 2 HOME, 3 STANDUP, 4 WARMUP, 5 MODEL, 6 FAULT.
 | 3 | Driver fault / E-stop |
 | 4 | Clock/sample gap hoặc queued sample quá cũ |
 | 5 | Thiếu applied_target khi warm-up/policy |
-| 6 | Recovery helper lỗi |
+| 6 | Kế hoạch gập lỗi (pitch quá giới hạn hoặc đầu vào không hữu hạn) |
 | 7 | Policy lỗi |
 | 8 | Inference vượt hard deadline hoặc trễ liên tiếp |
 | 9 | Ngã >70° trong MODEL |
@@ -159,9 +158,9 @@ Mode: 0 WAIT_LINK, 1 DISARMED, 2 HOME, 3 STANDUP, 4 WARMUP, 5 MODEL, 6 FAULT.
 
 LF vẫn giữ telemetry timeout 30 ms. Cửa sổ ACK thích ứng từ 30 ms tới mức trần
 60 ms trong `config/runtime.json`: runtime học latency ACK đầu-cuối từ các
-`applied_seq` tiến triển gần nhất; ở pha `Catching`, cộng thêm thời gian ổn định
-bánh 25 ms và chu kỳ bus mới nhất (hoặc dự phòng 15 ms nếu chẩn đoán đã cũ).
-Biên 8 ms bù jitter; chẩn đoán bus chỉ dùng khi mới hơn 500 ms. Timeout ghi
+`applied_seq` tiến triển gần nhất (p90 của tối đa 32 mẫu, cộng biên 8 ms bù jitter;
+chưa có mẫu thì dùng mức sàn). Không còn nới thêm theo pha: phần chờ bánh bật lại của pha
+Kneeling cũ đã bị xóa. Timeout ghi
 sequence, tuổi ACK và cửa sổ đã chọn khi hết hạn. Cơ chế không đổi TTL TARGET
 20 ms, source age hay yêu cầu ACK từ cả hai bus. Trạng thái LF công bố cửa sổ,
 tuổi ACK và số mẫu latency trong `ack_diagnostics`.
@@ -169,6 +168,24 @@ Policy chạy 100 Hz theo lịch tuyệt đối.
 Inference >10 ms: bỏ prediction, giữ reference trước, hidden vẫn cập nhật.
 Inference >15 ms hoặc 3 lần trễ liên tiếp: FAULT. Không handoff bằng prediction muộn.
 Thông tin chi tiết, latency và counter được ghi thêm vào status JSON của LF.
+
+### Chất lượng đường truyền
+
+Status JSON tách hai nguyên nhân dễ lẫn nhau:
+
+- `link_quality`: suy ra từ dấu thời gian 5 ms của MCU, không phụ thuộc OS. `gaps` và
+  `lost_frames` đếm telemetry MCU đã đóng dấu nhưng LF không nhận; `max_burst` là số frame
+  mất liên tiếp lớn nhất; `max_gap_us` là khoảng lớn nhất giữa hai mẫu. Mất từ 3 frame liên
+  tiếp trở lên dễ chạm TTL 20 ms của MCU. Lệch đồng hồ MCU nhỏ hơn nửa chu kỳ không được
+  tính là mất frame.
+- `loop_stats`: do chính LF đo. `max_iteration_gap_ms`/`stalls_over_10ms` thấy LF bị đứng
+  (bị preempt, RT throttling); `max_frames_per_read` thấy hàng đợi tồn; `handler_ms_histogram`
+  (biên `handler_ms_edges`) và `max_read_to_write_ms` là thời gian từ lúc đọc UART đến lúc
+  TARGET được ghi, `late_writes_over_5ms` đếm các lần trễ hơn một chu kỳ;
+  `max_status_write_ms` và `status_write_failures` cho phần ghi file trạng thái.
+
+Đọc cùng nhau: `lost_frames` tăng mà `stalls_over_10ms` đứng yên là lỗi đường dây/MCU;
+cả hai cùng tăng là LF quá tải. TARGET được ghi ngay sau mỗi telemetry, không gom theo lần đọc.
 
 
 ### Chụp HOME khi Disable: ENCODER_HOME (0x83), ENCODER_HOME_ACK (0x05)

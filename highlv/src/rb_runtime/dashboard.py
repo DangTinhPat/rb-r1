@@ -207,7 +207,7 @@ class DashboardServer:
 class DashboardProcess:
     """Web is expendable: separate GIL/scheduler, no UART or controller objects.
 
-    Launch with exec rather than fork: ONNX/RKNN may already own native threads.
+    Launch with exec rather than fork: RKNN may already own native threads.
     Only a fresh command socket connects the child to the control process.
     """
 

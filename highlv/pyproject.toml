@@ -5,12 +5,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "rb-runtime"
 version = "0.1.0"
-description = "RB-R1 upper-layer hybrid recovery and policy inference runtime"
+description = "RB-R1 upper-layer fold-down planner and policy inference runtime"
 requires-python = ">=3.9"
 dependencies = []
-
-[project.optional-dependencies]
-cpu = ["numpy>=1.24", "onnxruntime>=1.17"]
 
 [project.scripts]
 rb-runtime = "rb_runtime.app:main"

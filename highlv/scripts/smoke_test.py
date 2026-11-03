@@ -6,6 +6,7 @@ from collections import deque
 import json
 import os
 from pathlib import Path
+import shutil
 import socket
 import subprocess
 import sys
@@ -97,11 +98,38 @@ def operator(path, data):
         return json.loads(response)
 
 
+# The shipped model only runs on the board's NPU, so the host smoke test starts the real runtime
+# with a stand-in policy. Everything else (UART/socket loop, core, web) is the production code.
+FAKE_POLICY_RUNTIME = """
+import sys
+import rb_runtime.app as app
+
+class FakePolicy:
+    def __init__(self, *args, **kwargs):
+        self.reset()
+
+    def reset(self):
+        self.steps, self.last_ms, self.hidden = 0, 0.1, [0.0] * 512
+
+    def step(self, obs):
+        self.steps += 1
+        return [0.0] * 6
+
+    def close(self):
+        pass
+
+app.Policy = FakePolicy
+app.main()
+"""
+
+
 def run_smoke_test(with_web=False):
     checks = []
     with tempfile.TemporaryDirectory(prefix="rb-runtime-smoke-") as temp:
         temp = Path(temp)
         wire, command = temp / "mcu.sock", temp / "command.sock"
+        status_dir = temp / "status"
+        status_dir.mkdir()
         env = dict(
             os.environ, PYTHONPATH=str(ROOT / "src"), PYTHONDONTWRITEBYTECODE="1"
         )
@@ -109,16 +137,14 @@ def run_smoke_test(with_web=False):
             process = subprocess.Popen(
                 [
                     sys.executable,
-                    "-m",
-                    "rb_runtime",
-                    "--backend",
-                    "onnx",
+                    "-c",
+                    FAKE_POLICY_RUNTIME,
                     "--socket",
                     str(wire),
                     "--command-socket",
                     str(command),
                     "--status-file",
-                    str(temp / "status.json"),
+                    str(status_dir / "status.json"),
                     "--realtime-priority",
                     "0",
                     *(["--web-host", "127.0.0.1", "--web-port", "0",
@@ -203,6 +229,27 @@ def run_smoke_test(with_web=False):
                 time.sleep(0.005)
                 assert peer.tick()[2] == p.HOME_PD
                 checks.append("bad CRC ignored")
+
+                def ticking(seconds):
+                    end = time.monotonic() + seconds
+                    while time.monotonic() < end:
+                        time.sleep(0.005)
+                        assert peer.tick()[2] == p.HOME_PD
+
+                # The status file is rewritten once per second; wait for one written after the CRC error.
+                ticking(1.3)
+                status = json.loads((status_dir / "status.json").read_text())
+                assert status["parser_errors"] > 0 and status["mode"] == "HOME"
+                assert set(status["link_quality"]) == {"gaps", "lost_frames", "max_gap_us", "max_burst"}
+                loop = status["loop_stats"]
+                assert loop["reads"] > 20 and sum(loop["handler_ms_histogram"]) > 20
+                assert loop["status_write_failures"] == 0
+                checks.append("status reports link quality, parser errors and loop timing")
+                # The dashboard is expendable: losing the status file must not stop the controller.
+                shutil.rmtree(status_dir)
+                ticking(1.3)
+                assert process.poll() is None
+                checks.append("controller keeps running after the status file disappears")
                 peer.sample.flags |= p.ESTOP
                 time.sleep(0.005)
                 assert peer.tick()[2] == p.DISABLED
@@ -216,7 +263,7 @@ def run_smoke_test(with_web=False):
                 checks.append("RESET creates new epoch and stays DISARMED")
                 return {
                     "passed": True,
-                    "backend": "onnx",
+                    "backend": "stand-in policy (the model needs the board NPU)",
                     "transport": "temporary Unix sockets",
                     "physical_hardware": False,
                     "checks": checks,

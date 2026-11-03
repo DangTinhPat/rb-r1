@@ -8,6 +8,7 @@ from collections import deque
 from . import protocol as p
 from .policy import observation, encode_targets, decode_actions
 
+TELEMETRY_PERIOD_US = 5000  # 200 Hz MCU telemetry
 MODES = {
     "WAIT_LINK": 0,
     "DISARMED": 1,
@@ -17,7 +18,7 @@ MODES = {
     "MODEL": 5,
     "FAULT": 6,
 }
-PHASES = ["Idle", "Folding", "Kneeling", "Catching", "Support", "Failed"]
+PHASES = ["Idle", "Folding", "Folded"]
 FAULTS = {
     "telemetry_timeout": 1,
     "invalid_telemetry": 2,
@@ -45,6 +46,9 @@ class HybridCore:
             "inferences": 0,
             "deadline_misses": 0,
         }
+        # What the telemetry sequence says about the UART, independent of the OS: frames the
+        # MCU stamped but LF never saw show up as gaps in its 5 ms clock. Cumulative.
+        self.link_quality = {"gaps": 0, "lost_frames": 0, "max_gap_us": 0, "max_burst": 0}
         self.new_epoch()
 
     def new_epoch(self):
@@ -62,7 +66,7 @@ class HybridCore:
         self.sent_targets = deque(maxlen=32)
         self.sent_target_at = {}
         self.ack_latency_ms = deque(maxlen=32)
-        self.support, self.phase = False, "Idle"
+        self.folded, self.phase = False, "Idle"
         self.action, self.velocity = [0.0] * 6, [0.0, 0.0]
         self.target = [0.0] * 6
         self.handoff_us = None
@@ -129,40 +133,19 @@ class HybridCore:
         self.mode = "FAULT"
         return self.output(self.rx_seq or 0)
 
-    def _target_ack_window_ms(self, now):
-        """Estimate a bounded ACK window from recent applied latency and phase."""
+    def _target_ack_window_ms(self):
+        """Estimate a bounded ACK window from recent applied latency."""
         floor_ms = self.config.get("target_ack_timeout_min_ms", 30)
         ceiling_ms = self.config["target_ack_timeout_ms"]
         margin_ms = self.config.get("target_ack_latency_margin_ms", 8)
         samples = sorted(self.ack_latency_ms)
-        if samples:
-            if len(samples) < 8:
-                observed_ms = samples[-1]
-            else:
-                observed_ms = samples[math.ceil(0.9 * len(samples)) - 1]
-            estimate_ms = observed_ms + margin_ms
+        if not samples:
+            return floor_ms
+        if len(samples) < 8:
+            observed_ms = samples[-1]
         else:
-            observed_ms = 0.0
-            estimate_ms = floor_ms
-
-        if self.phase == "Catching":
-            settle_ms = self.config.get("target_ack_wheel_settle_ms", 25)
-            diag_max_age_ms = self.config.get("target_ack_diag_max_age_ms", 500)
-            diag_age_ms = (
-                float("inf") if self.mcu_diagnostics_rx is None
-                else max(0.0, 1000 * (now - self.mcu_diagnostics_rx))
-            )
-            if self.mcu_diagnostics is not None and diag_age_ms <= diag_max_age_ms:
-                diag = self.mcu_diagnostics
-                cycle_ms = max(
-                    diag.get("cycle_l_us", 0), diag.get("cycle_r_us", 0),
-                    diag.get("cycle_l_max_us", 0), diag.get("cycle_r_max_us", 0),
-                ) / 1000.0
-            else:
-                cycle_ms = self.config.get("target_ack_unknown_cycle_ms", 15)
-            estimate_ms = max(estimate_ms, settle_ms + max(cycle_ms, observed_ms) + margin_ms)
-
-        return max(floor_ms, min(ceiling_ms, estimate_ms))
+            observed_ms = samples[math.ceil(0.9 * len(samples)) - 1]
+        return max(floor_ms, min(ceiling_ms, observed_ms + margin_ms))
 
     def _target_ack_timeout_detail(self, applied_seq, now):
         """Track applied progress and fault only after the adaptive ACK window.
@@ -181,7 +164,7 @@ class HybridCore:
             self.last_ack, self.last_ack_rx = applied_seq, now
 
         ack_age = now - self.last_ack_rx if self.last_ack_rx is not None else float("inf")
-        timeout_ms = self._target_ack_window_ms(now)
+        timeout_ms = self._target_ack_window_ms()
         if ack_age <= timeout_ms / 1000:
             return None
 
@@ -376,7 +359,7 @@ class HybridCore:
             ):
                 self.counters["rejected"] += 1
                 self.last_command_error = (
-                    "ARM: chưa có telemetry hợp lệ đủ mới (giới hạn 30 ms)"
+                    f"ARM: chưa có telemetry hợp lệ đủ mới (giới hạn {self.config['telemetry_timeout_ms']:g} ms)"
                 )
                 return [self.status()]
             if any(
@@ -385,7 +368,8 @@ class HybridCore:
             ):
                 self.counters["rejected"] += 1
                 self.last_command_error = (
-                    "ARM: góc khớp lệch HOME quá giới hạn 0,15 rad"
+                    "ARM: góc khớp lệch HOME quá giới hạn "
+                    + f"{self.config['home_tolerance_rad']:.2f}".replace(".", ",") + " rad"
                 )
                 return [self.status()]
             self.policy.reset()
@@ -397,7 +381,7 @@ class HybridCore:
             self.sent_target_at.clear()
             self.ack_latency_ms.clear()
             self.action, self.velocity = [0.0] * 6, [0.0, 0.0]
-            self.support, self.phase, self.handoff_us = False, "Idle", None
+            self.folded, self.phase, self.handoff_us = False, "Idle", None
             self.mode = "HOME"
             return [self.status()]
         if op == "VELOCITY" and self.mode in ("HOME", "STANDUP", "WARMUP", "MODEL"):
@@ -439,6 +423,15 @@ class HybridCore:
                 self.fail("clock_gap", "queued telemetry exceeds age limit"),
                 self.status(),
             ]
+        if self.last_stamp is not None:
+            gap = frame.stamp - self.last_stamp
+            lost = (gap + TELEMETRY_PERIOD_US // 2) // TELEMETRY_PERIOD_US - 1
+            quality = self.link_quality
+            quality["max_gap_us"] = max(quality["max_gap_us"], gap)
+            if lost > 0:
+                quality["gaps"] += 1
+                quality["lost_frames"] += lost
+                quality["max_burst"] = max(quality["max_burst"], lost)
         self.last_stamp, self.last_rx, self.last_t = frame.stamp, now, t
         self.counters["telemetry"] += 1
         if self.mode in ("DISARMED", "FAULT", "WAIT_LINK"):
@@ -466,7 +459,7 @@ class HybridCore:
                 self.action = encode_targets(t.applied_target)
             handoff_ready = (
                 elapsed >= self.config["handoff_earliest_s"]
-                and self.support
+                and self.folded
                 and self.policy.steps >= self.config["warmup_steps"]
                 and self.mode != "MODEL"
             )
@@ -518,7 +511,7 @@ class HybridCore:
         if self.mode == "MODEL":
             return [self.output(frame.seq, p.POLICY_PD, 3, self.target, sent_at=now)]
         try:
-            self.support, phase, flags, self.target, ff = self.logic.step(elapsed, t)
+            self.folded, phase, flags, self.target, ff = self.logic.step(elapsed, t)
             self.phase = PHASES[phase] if 0 <= phase < len(PHASES) else "Unknown"
         except Exception as error:
             return [self.fail("logic_fault", str(error)), self.status()]
@@ -534,7 +527,7 @@ class HybridCore:
         return {
             "mcu_diagnostics": diagnostics,
             "ack_diagnostics": {
-                "window_ms": self._target_ack_window_ms(now),
+                "window_ms": self._target_ack_window_ms(),
                 "age_ms": None if self.last_ack_rx is None else max(0.0, 1000 * (now - self.last_ack_rx)),
                 "latency_samples": len(self.ack_latency_ms),
                 "latency_ms_recent_max": max(self.ack_latency_ms, default=0.0),
@@ -552,5 +545,6 @@ class HybridCore:
             "consecutive_deadline_misses": self.consecutive_misses,
             "counters": self.counters,
             "link": self.link,
+            "link_quality": dict(self.link_quality),
             "last_telemetry_flags": self.last_telemetry_flags,
         }

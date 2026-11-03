@@ -2,7 +2,7 @@
 
 One repository, two layers joined by the HCR1 UART protocol:
 
-- `highlv/` — upper-layer Luckfox runtime (recovery core, policy inference,
+- `highlv/` — upper-layer Luckfox runtime (fold-down planner, policy inference,
   HCR1 master). Not MCU firmware or a simulator.
 - `lowlv/` — lower-layer ESP32-S3 firmware (formerly `gatewayLF`): HCR1 slave,
   IMU, BL4012 motor buses, deadline/fault latch, OTA.
@@ -39,12 +39,15 @@ control flow.
 
 ## highlv/ (Luckfox runtime)
 
-- Recovery FF: hipL/R,kneeL/R rates. Optional upstream torque is not actor input.
-- Preserve trained action mapping, ONNX embedded normalization vs RKNN external
-  normalization, absolute policy schedule, 50-step warm-up and GRU handoff.
-- Keep recovery/support behaviour while pruning dependencies. The core still
-  needs supported balance until policy owns the output. Do not replace it with
-  pose playback or bypass a fault/deadline to make tests pass.
+- Fold FF: hipL/R,kneeL/R rates. Optional upstream torque is not actor input.
+- Preserve the action mapping and observation layout in `policy.py` until the
+  model contract is confirmed (RKNN external normalization), the absolute policy
+  schedule, 50-step warm-up and GRU handoff. The shipped model has no ONNX source.
+- LF plans only the fold-down (`fold.py` over `native/fold_planner.cpp`); standing
+  up belongs to the policy. The old stand-up core (Kneeling/Catching/Support, LQR)
+  was deleted on purpose. Do not bypass a fault/deadline to make tests pass.
+- Python orchestrates; C++ only where it measurably wins. A native call through
+  ctypes costs ~1-4 us, so a piece that is cheaper than that stays in Python.
 - Run `scripts/build.sh host`, `scripts/test.sh`, `scripts/smoke_test.py` for
   related changes. Mapping changes require `tests/test_flow_contract.py`.
 - Build ARM when changing native/build code and the cross-toolchain is available.

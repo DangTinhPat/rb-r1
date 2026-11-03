@@ -1,31 +1,31 @@
 # reconect — Runtime hybrid tầng trên của RB-R1
 
 Project chạy trên **Luckfox RV1106** để nhận telemetry từ ESP32, chạy core đứng dậy,
-thực hiện inference policy Beni512 và truyền target trở lại MCU qua HCR1.
+thực hiện inference policy (model fitted22500) và truyền target trở lại MCU qua HCR1. LF chỉ tự
+lập kế hoạch bước gập từ HOME xuống sàn (bộ gập viết bằng C++); việc đứng lên thuộc về model.
 
 Source được tổ chức thành project độc lập trong repository
 [`DangTinhPat/reconect`](https://github.com/DangTinhPat/reconect), không có
-submodule hoặc liên kết tới source ngoài thư mục này. Core recovery cần thiết
-được giữ trong `native/`; nguồn gốc thuật toán được ghi tại
-[docs/source_provenance.md](docs/source_provenance.md).
+submodule hoặc liên kết tới source ngoài thư mục này. Lịch sử core đứng dậy đã bị xóa
+(nguồn gốc cũ) được ghi tại [docs/source_provenance.md](docs/source_provenance.md).
 
 ## 1. Phạm vi và trách nhiệm
 
 | Thành phần | Trách nhiệm |
 |---|---|
-| Luckfox / runtime này | UART, kiểm tra telemetry, máy trạng thái hybrid, core recovery C++, observation, inference RKNN, GRU, chọn và gửi target, watchdog và dashboard |
+| Luckfox / runtime này | UART, kiểm tra telemetry, máy trạng thái hybrid, kế hoạch gập (C++), observation, inference RKNN, GRU, chọn và gửi target, watchdog và dashboard |
 | ESP32 / firmware riêng | Đọc IMU và encoder, ước lượng attitude, homing, đổi tọa độ motor, áp dụng target, xác nhận applied reference và watchdog motor |
 | Driver motor | Đóng vòng và thực thi lệnh do firmware MCU gửi |
 
 Project này không chứa firmware ESP32, bus driver motor, môi trường training,
-MuJoCo, CAD hoặc viewer. Các bài test dùng CPU, pipe và socket giả lập; không mở UART thật.
+MuJoCo, CAD hoặc viewer. Các bài test dùng CPU và socket giả lập; không mở UART thật.
 
 ```text
 ESP32 ── TELEMETRY / HCR1 ──► runtime LF
                                │
                   ┌────────────┴────────────┐
                   │                         │
-           core recovery C++       observation → RKNN + GRU
+         kế hoạch gập (C++)       observation → RKNN + GRU
                   │                         │
                   └────────────┬────────────┘
                         máy trạng thái
@@ -33,10 +33,8 @@ ESP32 ── TELEMETRY / HCR1 ──► runtime LF
 ESP32 ◄── TARGET / HCR1 ────────┘
 ```
 
-Core recovery hiện có chức năng đứng dậy và giữ Support trong lúc chờ bàn giao.
-Đây là lý do runtime cần một phần core điều khiển C++; model chỉ nhận quyền sau
-khi các điều kiện chuyển pha đã đạt. Tên, namespace và build target đã được quy
-hoạch theo vai trò trong RB-R1, không còn cây firmware `v3` hoặc thư mục vendor cũ.
+Kế hoạch gập chỉ hạ hông từ HOME xuống sàn rồi giữ (xem [docs/architecture.md](docs/architecture.md));
+model nhận quyền sau khi gập xong và các điều kiện chuyển pha đã đạt.
 
 ## 2. Cấu trúc thư mục
 
@@ -44,12 +42,12 @@ hoạch theo vai trò trong RB-R1, không còn cây firmware `v3` hoặc thư m�
 rb-r1/
 ├── README.md
 ├── AGENTS.md                  # Quy ước bảo trì source và contract
-├── CMakeLists.txt             # Build native helper và tensor helper
+├── CMakeLists.txt             # Build hai thư viện native: bộ gập và tensor NPU
 ├── pyproject.toml             # Package Python rb-runtime
 ├── src/rb_runtime/
 │   ├── app.py                 # Event loop, transport, watchdog, status
-│   ├── hybrid_core.py         # Máy trạng thái và lịch chuyển recovery → policy
-│   ├── recovery.py            # Giao tiếp pipe với process recovery C++
+│   ├── hybrid_core.py         # Máy trạng thái và lịch chuyển gập → policy
+│   ├── fold.py                # Kế hoạch gập hông từ HOME xuống sàn (bọc libfold_planner.so)
 │   ├── policy.py              # Observation 32D, action mapping, GRU
 │   ├── rknn_backend.py        # Binding RKNN NPU qua ctypes
 │   ├── protocol.py            # Codec HCR1 phía Python
@@ -58,20 +56,13 @@ rb-r1/
 │   ├── dashboard.py           # HTTP dashboard có access token
 │   └── paths.py               # Định vị asset và native build theo project
 ├── native/
-│   ├── standup_main.cpp       # Adapter process recovery, pipe nhị phân
-│   ├── tensor_math.c          # Quantization và gọi NPU trong một lượt native
-│   ├── include/rb/recovery/   # Core recovery và hình học chân
-│   ├── include/rb/control/    # LQR, estimator và mô hình hình học được core dùng
-│   └── src/                   # 6 file triển khai cần cho recovery
-├── runtime/                   # Runtime C++ (rb_runtime): lõi trạng thái, HCR1, policy, vòng lặp
-│   ├── include/rb/runtime/    # hybrid_core, protocol, policy, logic, transport, json...
-│   ├── src/                   # Bản C++ của hybrid_core.py, app.py, protocol.py, recovery.py...
-│   └── tests/runtime_tests.cpp  # Test host cho runtime C++
+│   ├── fold_planner.cpp       # Bộ gập C++ (freestanding, nạp qua ctypes)
+│   └── tensor_math.c          # Quantization và gọi NPU trong một lượt native
 ├── config/runtime.json        # Cấu hình mặc định trên LF
-├── models/                    # ONNX, RKNN, normalizer và manifest SHA256
+├── models/                    # RKNN (fitted22500), normalizer và manifest SHA256
 ├── protocol/include/          # Codec HCR1 C để đối chiếu với MCU
 ├── scripts/                   # Build, chạy, service, lệnh và chẩn đoán
-├── tests/                     # Unit, contract, codec, native và ONNX reference
+├── tests/                     # Unit, contract, codec, bộ gập và dữ liệu tham chiếu
 ├── web/index.html             # Giao diện vận hành
 ├── deploy/S96rbruntime         # Mẫu init script Buildroot
 ├── docs/                      # Kiến trúc, contract, review và lịch sử kiểm chứng
@@ -94,7 +85,7 @@ TARGET có 6 giá trị chính:
          4 góc tuyệt đối sau homing (rad)         2 tốc độ (rad/s)
 ```
 
-Recovery có thêm 4 vận tốc feedforward hipL/R, kneeL/R, đơn vị rad/s.
+Reference gập có thêm 4 vận tốc feedforward hipL/R, kneeL/R, đơn vị rad/s.
 TARGET không chứa torque command. Chi tiết payload, thứ tự và ACK nằm trong
 [docs/protocol.md](docs/protocol.md).
 
@@ -103,9 +94,9 @@ TARGET không chứa torque command. Chi tiết payload, thứ tự và ACK nằ
 | `WAIT_LINK` | Chờ HELLO/ACK và lập epoch |
 | `DISARMED` | Có liên kết; gửi TARGET disabled |
 | `HOME`, 0–3 s | Giữ tư thế home |
-| `STANDUP`, từ 3 s | Core recovery tạo reference 200 Hz |
-| `WARMUP`, từ 12,5 s | Policy chạy 100 Hz để cập nhật GRU; recovery vẫn sở hữu target |
-| `MODEL`, sớm nhất 13 s | Chuyển khi Support, đủ ít nhất 50 warm-up inference và prediction đúng deadline |
+| `STANDUP`, từ 3 s | Kế hoạch gập tạo reference 200 Hz: hông hạ 2,4 rad/s tới 3,05 rad (~1,3 s) rồi giữ |
+| `WARMUP`, từ 4,775 s | Policy chạy 100 Hz để cập nhật GRU; kế hoạch gập vẫn sở hữu target |
+| `MODEL`, sớm nhất 5,275 s (1 s sau khi gập xong) | Chuyển khi đã gập xong (`Folded`), đủ ít nhất 50 warm-up inference và prediction đúng deadline |
 | `FAULT` | Disabled output; lỗi được giữ cho tới RESET |
 
 Trong warm-up, `last_action` lấy từ reference MCU thực sự đã áp dụng.
@@ -113,41 +104,29 @@ Bàn giao giữ nguyên GRU. Giữa hai lượt policy, runtime giữ target và
 vụ telemetry ở 200 Hz. Không thêm tanh hoặc clamp action vào `[-1,1]`.
 
 Các giới hạn hiện tại: telemetry 30 ms; ACK thích ứng 30–60 ms theo latency
-applied gần đây, có cộng dự phòng settling bánh khi vào Catching; prediction muộn hơn 10 ms bị bỏ;
+applied gần đây; prediction muộn hơn 10 ms bị bỏ;
 trên 15 ms hoặc 3 lần muộn liên tiếp gây FAULT; MCU phải thực thi TTL 20 ms riêng.
 Đây là cơ chế xử lý deadline, không phải cam kết hard real-time của Linux.
 
 ## 4. Build và kiểm tra trên máy phát triển
 
-Cần Linux, Python >=3.9, CMake >=3.20 và compiler C/C++17.
-Unit test dùng thư viện chuẩn. Kiểm tra model CPU và smoke test cần NumPy,
-ONNX Runtime. Có thể cài riêng trong venv:
+Cần Linux, Python >=3.9 (chỉ thư viện chuẩn), CMake >=3.20 và compiler C/C++17.
 
 ```bash
-cd /duong/dan/rb-r1
-python3 -m venv .venv
-.venv/bin/python -m pip install -e '.[cpu]'
 ./scripts/build.sh host
-RB_PYTHON=.venv/bin/python ./scripts/test.sh
-.venv/bin/python scripts/smoke_test.py --report reports/current/smoke_test.json
+./scripts/test.sh
+python3 scripts/smoke_test.py --report reports/current/smoke_test.json
 ```
 
-Nếu Python hệ thống đã có các thư viện CPU, có thể dùng `python3` trực tiếp.
-Test native cần build host trước; test native/ONNX sẽ báo SKIP nếu thiếu điều kiện,
-nên cần xem cả số test bị bỏ qua khi đánh giá kết quả.
+Test cần build host trước vì chúng nạp thư viện native. Model RKNN chỉ chạy trên NPU của board
+nên trên laptop không có kiểm tra số học model: các test kiểm hash và định dạng artifact, còn
+smoke test khởi chạy runtime thật với một policy giả (logic UART/socket, lõi, web là mã thật).
+Kiểm model thật là `scripts/verify_npu.py` trên LF.
 
-Smoke test tự khởi chạy runtime CPU, tạo các socket tạm và đóng chúng sau khi
-kiểm tra. Không cần MCU hoặc robot. Thêm `--with-web` để kiểm tra mất/khôi phục HTTP
-trong khi core tiếp tục HOME qua MCU giả. Nó kiểm tra handshake, lệnh local, HOME,
-CRC lỗi, E-stop và RESET; không xác nhận động lực học đứng dậy hoặc cân bằng.
-
-Chạy runtime host thủ công với MCU emulator riêng:
-
-```bash
-./scripts/run.sh --backend onnx \
-  --socket /tmp/rb-hybrid-runtime.sock \
-  --realtime-priority 0 --no-web
-```
+Smoke test tự khởi chạy runtime, tạo các socket tạm và đóng chúng sau khi kiểm tra. Không cần
+MCU hoặc robot. Thêm `--with-web` để kiểm tra mất/khôi phục HTTP trong khi core tiếp tục HOME
+qua MCU giả. Nó kiểm tra handshake, lệnh local, HOME, CRC lỗi, E-stop và RESET; không xác nhận
+động lực học đứng dậy hoặc cân bằng.
 
 ## 5. Build cho Luckfox RV1106
 
@@ -163,34 +142,34 @@ Script hiện hỗ trợ layout toolchain Debian GCC 13 với compiler
 `usr/bin/arm-linux-gnueabihf-{gcc,g++}-13`. Toolchain khác cần điều chỉnh cấu hình
 compiler tương ứng. Kết quả:
 
-- `build/arm/bin/standup_helper`: executable ARMv7 hard-float link static.
+- `build/arm/lib/libfold_planner.so`: bộ gập C++, không phụ thuộc libc.
 - `build/arm/lib/libtensor_math.so`: thư viện native không có phụ thuộc libc.
 
 Trên LF cần Python thư viện chuẩn, RKNN runtime tại
 `/oem/usr/lib/librknnmrt.so` và model RV1106 phù hợp. Runtime RKNN không cần NumPy,
-ONNX Runtime, GLFW hoặc MuJoCo. Giữ cây thư mục project cùng `build/arm/` và
+ONNX Runtime, GLFW hoặc MuJoCo (và không có backend ONNX). Giữ cây thư mục project cùng `build/arm/` và
 `models/` khi triển khai; runtime tự chọn native build ARM trên ARMv7.
 
-### Runtime C++ (`rb_runtime`)
+### Độ ổn định thời gian và chẩn đoán đường truyền
 
-`runtime/` chuyển luồng điều khiển từ Python sang C++ với cùng hành vi: máy trạng thái
-`HybridCore`, codec và parser HCR1, lịch policy 100 Hz, ACK thích ứng, HOME/calib IMU,
-vòng lặp UART/socket, socket lệnh vận hành, file trạng thái. Khác Python ở ba điểm:
+TARGET được ghi ngay sau từng telemetry (không gom theo lần đọc UART). Reference gập là hàm của
+thời gian MCU nên mất frame không làm nó trễ, và chạy trong cùng tiến trình nên không còn pipe
+tới tiến trình phụ. Khi chạy SCHED_FIFO runtime khóa bộ nhớ (`mlockall`) và bật
+`ASYNC_LOW_LATENCY` cho UART; lỗi ghi file trạng thái chỉ được log, không dừng điều khiển.
+Status JSON có `link_quality` (frame MCU đã đóng dấu nhưng LF không nhận, suy ra từ đồng hồ
+MCU) và `loop_stats` (LF tự đo: lần đứng >10 ms, hàng tồn, histogram thời gian xử lý, độ trễ
+từ lúc đọc UART đến lúc ghi target) để phân biệt dây mất frame với LF bị đứng. Chi tiết trong
+[docs/protocol.md](docs/protocol.md).
 
-- Logic đứng dậy chạy **trong cùng tiến trình** (`native/include/rb/recovery/standup_adapter.hpp`),
-  không còn pipe tới `standup_helper`. Khi lỗi vẫn ghi `/tmp/rb-standup-trace.json`.
-- Chỉ có backend `rknn` (nạp `librknnmrt.so` bằng `dlopen`, kiểm SHA256 theo
-  `models/manifest.json`). Backend `onnx` chỉ còn ở runtime Python.
-- Dashboard web vẫn là Python (`rb_runtime.dashboard`); `rb_runtime` khởi chạy nó như
-  tiến trình con (`RB_PYTHON`, mặc định `python3`). Giao diện, token và lệnh giữ nguyên.
+### Vì sao chỉ bộ gập là C++
 
-Build và test trên host: `./scripts/build.sh host && ./scripts/test.sh`
-(`build/host/bin/rb_runtime_tests`, mô phỏng MCU bằng socket, policy giả, không đụng NPU).
-Chạy: `build/host/bin/rb_runtime --serial /dev/ttyS2 ...` với các tùy chọn như bản Python.
-
-Bản ARM của `rb_runtime` **không** được build bởi `./scripts/build.sh arm`: nó `dlopen` thư viện
-NPU của board nên phải link động với libc của board (toolchain Luckfox SDK), còn toolchain
-Debian static ở trên không nạp được thư viện đó. Dùng `-DRB_BUILD_RUNTIME=ON` cùng toolchain SDK.
+Mỗi lần gọi native qua ctypes tốn khoảng 1–4 µs (host). Đo trên host: một bước gập chạy 1 µs
+bằng Python thuần, 2 µs qua ctypes; bộ phân tích frame HCR1 viết bằng C++ chậm hơn bản Python
+(4,3 µs so với 1,4 µs mỗi frame) vì bản Python vốn dùng các hàm C của thư viện chuẩn
+(`bytearray.find`, `struct`, `zlib.crc32`). Phần tiết kiệm thật của đợt này là bỏ tiến trình
+`standup_helper` và pipe (khoảng 0,5 ms mỗi tick trên LF). Bộ gập vẫn là C++ theo yêu cầu thiết
+kế; chuyển đường nhận/gửi sang C++ chỉ có lợi nếu cả vòng tick (UART → trạng thái → TARGET) nằm
+trong C++, không phải từng hàm lẻ gọi từ Python.
 
 ## 6. Chạy trên LF và vận hành
 
@@ -232,7 +211,7 @@ python3 scripts/command.py ESTOP
 python3 scripts/command.py RESET
 ```
 
-ARM bắt đầu HOME rồi tự chuyển sang đứng dậy; không có chế độ HOME-only riêng.
+ARM bắt đầu HOME rồi tự chuyển sang gập; không có chế độ HOME-only riêng.
 Trước ARM cần telemetry mới, IMU/encoder/homing hợp lệ và tư thế gần home.
 HOME feedback: hipL/R = 2,35706715 rad, kneeL/R = 0.
 RESET tạo phiên mới và không tự ARM. DISARM giữ nguyên lỗi đang latch.

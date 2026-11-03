@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RKNN backend for the recurrent Beni512 policy on RV1106 (stdlib only)."""
+"""RKNN backend for the recurrent GRU512 policy on RV1106 (stdlib only)."""
 
 import ctypes as C
 import json

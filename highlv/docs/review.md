@@ -1,5 +1,9 @@
 # Review và clean source — 2026-11-01
 
+> **Bản ghi lịch sử.** Mô tả đợt clean ngày 2026-11-01, khi core `rb::recovery` (đứng dậy,
+> Support, cân bằng LQR) còn tồn tại. Core đó, `standup_helper` và pipe đã bị xóa; xem
+> `architecture.md` cho trạng thái hiện tại.
+
 ## Phạm vi
 
 Tổ chức lại bản copy thành runtime tầng trên: telemetry, hybrid recovery,

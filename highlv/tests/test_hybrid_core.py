@@ -8,6 +8,12 @@ from rb_runtime.policy import encode_targets, decode_actions, observation
 ROOT = Path(__file__).resolve().parents[1]
 
 
+CONFIG = json.loads((ROOT / "config/runtime.json").read_text())
+TICK_S = 0.005
+WARMUP_TICKS = round(CONFIG["warmup_start_s"] / TICK_S)  # ticks before the policy starts to run
+WARMUP_TO_HANDOFF = round((CONFIG["handoff_earliest_s"] - CONFIG["warmup_start_s"]) / TICK_S)
+
+
 class FakePolicy:
     def reset(self):
         self.steps = 0
@@ -26,7 +32,7 @@ class FakeLogic:
         pass
 
     def step(self, elapsed, t):
-        return elapsed >= 8, 4, 3, [-0.7, -0.7, 0.2, 0.2, 0.0, 0.0], [0.0] * 4
+        return elapsed >= 4, 2 if elapsed >= 4 else 1, 3, [-0.7, -0.7, 0.2, 0.2, 0.0, 0.0], [0.0] * 4
 
 
 class Rig:
@@ -114,11 +120,11 @@ class StateTests(unittest.TestCase):
     def test_hybrid_warmup_handoff_preserves_state(self):
         r = Rig()
         r.control("ARM")
-        for _ in range(2500):
+        for _ in range(WARMUP_TICKS):
             r.telemetry()
             self.assertNotEqual(r.core.mode, "FAULT", r.core.reason)
             self.assertEqual(r.policy.steps, 0)
-        for _ in range(100):
+        for _ in range(WARMUP_TO_HANDOFF):
             r.telemetry()
             self.assertEqual(r.core.mode, "WARMUP")
         self.assertEqual(r.policy.steps, 50)
@@ -180,19 +186,26 @@ class StateTests(unittest.TestCase):
             r.telemetry()
         self.assertTrue(r.core.reason.startswith("no applied ACK for"))
 
-    def test_ack_window_covers_wheel_reenable_settle_but_stays_bounded(self):
+    def test_ack_window_follows_observed_latency_inside_fixed_bounds(self):
+        r = Rig()
+        self.assertEqual(r.core._target_ack_window_ms(), 30)  # no samples: the floor
+        r.core.ack_latency_ms.extend([5.0] * 8)
+        self.assertEqual(r.core._target_ack_window_ms(), 30)  # 5 + 8 ms margin stays at the floor
+        r.core.ack_latency_ms.extend([40.0] * 8)
+        self.assertEqual(r.core._target_ack_window_ms(), 48)  # p90 40 ms + 8 ms margin
+        r.core.ack_latency_ms.extend([200.0] * 8)
+        self.assertEqual(r.core._target_ack_window_ms(), 60)  # never above the configured ceiling
+
+    def test_stalled_ack_faults_with_the_window_and_sequences_named(self):
         r = Rig()
         r.control("ARM")
         r.telemetry()
-        r.telemetry()  # acknowledge the first HOME target before simulating re-enable
+        r.telemetry()  # acknowledge the first HOME target
         last_ack = r.core.last_ack
-        # Kneeling-to-Catching can spend 25 ms re-enabling and settling wheels,
-        # then needs one worker cycle and a telemetry return for its ACK.
-        for _ in range(8):  # 40 ms: longer than settle plus observed batch latency
+        for _ in range(5):  # 25 ms: inside the 30 ms floor
             r.ack = last_ack
             r.telemetry()
             self.assertNotEqual(r.core.mode, "FAULT", r.core.reason)
-        self.assertEqual(r.core.last_ack, last_ack)
         r.ack = r.core.sent_targets[-1]
         r.telemetry()
         self.assertEqual(r.core.mode, "HOME")
@@ -210,6 +223,36 @@ class StateTests(unittest.TestCase):
         self.assertIn("telemetry applied_seq=", failed.core.reason)
         self.assertIn("newest_sent_seq=", failed.core.reason)
 
+    def test_lost_frames_are_counted_from_the_mcu_clock_and_jitter_is_not(self):
+        r = Rig()
+        r.control("ARM")
+        for i in range(40):
+            r.telemetry(5400 if i % 2 else 4600)  # +-0.4 ms MCU clock jitter
+        self.assertEqual((r.core.link_quality["lost_frames"], r.core.link_quality["gaps"]), (0, 0))
+        r.telemetry(10000)  # one telemetry frame never arrived
+        self.assertEqual(r.core.link_quality, {"gaps": 1, "lost_frames": 1, "max_gap_us": 10000, "max_burst": 1})
+        r.telemetry(20000)  # three lost
+        r.telemetry(28000)  # five lost: still under the 30 ms limit
+        self.assertNotEqual(r.core.mode, "FAULT", r.core.reason)
+        self.assertEqual(r.core.link_quality["lost_frames"], 1 + 3 + 5)
+        self.assertEqual(r.core.link_quality["max_burst"], 5)
+        self.assertEqual(r.core.snapshot()["link_quality"]["lost_frames"], 9)
+
+    def test_arm_refusals_quote_the_configured_limits(self):
+        r = Rig()
+        r.core.config["telemetry_timeout_ms"] = 40
+        r.stamp += 100000
+        r.control("ARM")
+        self.assertIn("40 ms", r.core.last_command_error)
+        far = Rig()
+        far.t.q[0] = 3.0
+        far.telemetry()
+        far.control("ARM")
+        self.assertIn("0,15 rad", far.core.last_command_error)
+        far.core.config["home_tolerance_rad"] = 0.2
+        far.control("ARM")
+        self.assertIn("0,20 rad", far.core.last_command_error)
+
     def test_mcu_reboot_starts_new_epoch_despite_old_sequence(self):
         r = Rig()
         r.control("ARM")
@@ -223,7 +266,7 @@ class StateTests(unittest.TestCase):
     def test_absolute_policy_schedule_tolerates_timestamp_jitter(self):
         r = Rig()
         r.control("ARM")
-        for _ in range(2500):
+        for _ in range(WARMUP_TICKS):
             r.telemetry()
         for i in range(200):
             r.telemetry(5001 if i % 2 else 4999)
@@ -233,7 +276,7 @@ class StateTests(unittest.TestCase):
         for case in ("feedback", "deadline"):
             r = Rig()
             r.control("ARM")
-            for _ in range(2500):
+            for _ in range(WARMUP_TICKS):
                 r.telemetry()
             if case == "feedback":
                 r.t.flags &= ~p.TARGET_VALID
@@ -245,7 +288,7 @@ class StateTests(unittest.TestCase):
     def test_late_predictions_are_held_and_repeated_lateness_faults(self):
         r = Rig()
         r.control("ARM")
-        for _ in range(2601):
+        for _ in range(WARMUP_TICKS + WARMUP_TO_HANDOFF + 1):
             r.telemetry()
         self.assertEqual(r.core.mode, "MODEL")
         target = r.core.target.copy()
@@ -264,7 +307,7 @@ class StateTests(unittest.TestCase):
     def test_late_first_policy_prediction_does_not_handoff(self):
         r = Rig()
         r.control("ARM")
-        for _ in range(2600):
+        for _ in range(WARMUP_TICKS + WARMUP_TO_HANDOFF):
             r.telemetry()
         r.policy.last_ms = 11.0
         r.telemetry()

@@ -1,5 +1,9 @@
 # Kiểm chứng bản clean — 2026-11-01
 
+> **Bản ghi lịch sử** của đợt kiểm 2026-11-01. Các dòng nhắc recovery helper, Support và
+> `check_standup_timing.py` mô tả trạng thái trước khi core đứng dậy bị xóa; chúng không còn
+> là lệnh hay kết quả hiện hành.
+
 ## Kết quả trên máy phát triển
 
 | Mức kiểm chứng | Kết quả |
@@ -33,7 +37,6 @@ python3 scripts/smoke_test.py --report reports/current/smoke_test.json
 
 RB_CROSS_ROOT=/duong/dan/toolchain/root ./scripts/build.sh arm
 readelf -d build/arm/lib/libtensor_math.so
-file build/arm/bin/standup_helper
 ```
 
 Unit test cần dùng Python có NumPy/ONNX Runtime và build host để chạy đủ.
@@ -59,7 +62,6 @@ Sau khi có yêu cầu triển khai/kiểm LF riêng, dùng các tool chẩn đo
 đã dừng và có điều kiện kiểm phù hợp:
 
 ```bash
-python3 scripts/check_standup_timing.py --report reports/current/standup_timing.json
 python3 scripts/verify_npu.py --report reports/current/npu_reference.json
 ```
 

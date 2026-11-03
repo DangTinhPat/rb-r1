@@ -1,6 +1,7 @@
 import fcntl
 import glob
 import os
+import sys
 import termios
 
 
@@ -31,10 +32,27 @@ def open_serial(path, baud):
         attrs[6][termios.VTIME] = 0
         termios.tcsetattr(fd, termios.TCSANOW, attrs)
         termios.tcflush(fd, termios.TCIOFLUSH)
+        _low_latency(fd)
         return fd
     except Exception:
         os.close(fd)
         raise
+
+
+TIOCGSERIAL, TIOCSSERIAL, ASYNC_LOW_LATENCY = 0x541E, 0x541F, 0x2000
+
+
+def _low_latency(fd):
+    """Deliver received bytes from the interrupt path instead of a deferred workqueue.
+
+    Best effort: not every driver implements it (a pty does not)."""
+    try:
+        info = bytearray(fcntl.ioctl(fd, TIOCGSERIAL, bytes(128)))
+        flags = int.from_bytes(info[16:20], sys.byteorder) | ASYNC_LOW_LATENCY  # serial_struct.flags
+        info[16:20] = flags.to_bytes(4, sys.byteorder)
+        fcntl.ioctl(fd, TIOCSSERIAL, bytes(info))
+    except (OSError, ValueError):
+        pass
 
 
 class Writer:

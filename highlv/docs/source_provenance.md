@@ -1,5 +1,10 @@
 # Nguồn gốc và phạm vi bản sao
 
+> **Bản ghi lịch sử.** Phần "Core recovery" dưới đây mô tả mã Lumi-Quantum đã từng nằm trong
+> `native/` (StandUp, RecoveryController, LQR). Mã đó đã bị xóa khỏi project; model đảm nhận
+> việc đứng lên. Chỉ kế hoạch gập (`fold.py`, `FoldLogic`) còn lại. Quỹ đạo Folding cũ được
+> giữ làm số liệu tham chiếu trong `tests/data/fold_reference.json`. Lịch sử đầy đủ nằm trong git.
+
 RB-R1 được quản lý trong repository riêng `DangTinhPat/reconect` theo yêu cầu
 người dùng. Không có submodule, symlink hoặc hardlink tới repository nguồn;
 remote `origin` trỏ tới `https://github.com/DangTinhPat/reconect.git`.
@@ -54,16 +59,20 @@ hoặc xác nhận quỹ đạo trên robot thật.
 
 ## Model
 
-ONNX actor FP32 Beni512 checkpoint 19500 của LU/RB v1.3, flat task:
+Policy hiện dùng là `fitted22500_dfp16_jumprec.rknn` cùng `fitted22500_normalizer.json`, sao
+chép nguyên byte từ `/userdata/lu_v13_gru256_hil/` trên LF vào `models/`. Chưa có tài liệu về
+nguồn huấn luyện, checkpoint hay observation/action contract của nó. Hash nằm trong
+`models/manifest.json`; `Policy` kiểm tra trước khi load.
 
 ```text
-SHA256 model_19500.onnx
-bfb8097f9240193e9075ee8afe283baeebdeb7ddeb84f98e87cd0a44b3e7c993
+SHA256 fitted22500_dfp16_jumprec.rknn
+a8176c9bde0053757a1cae9e30ee38901f6def7b787670319f576fc9697e0f29
+SHA256 fitted22500_normalizer.json
+6162a8ba67cf2fb765a35777cfc3b1b0df246491738cfd4e69f55382011462ec
 ```
 
-RKNN DFP16 và normalizer được giữ nguyên byte từ bộ runtime được copy vào project.
-Hash từng artifact nằm trong `models/manifest.json`; `Policy` kiểm tra trước load.
-Không kèm checkpoint training, critic hoặc optimizer.
+Model trước đó (Beni512 checkpoint 19500, ONNX FP32 `bfb8097f…`, RKNN `4e5b1dd4…`) đã bị gỡ khỏi
+project; lịch sử có trong git. Không kèm checkpoint training, critic hoặc optimizer.
 
 ## Bản trước khi clean
 

@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Compare RKNN against recurrent ONNX reference on LF with runtime stopped."""
+"""Replay a recorded observation sequence through the RKNN policy on LF with the runtime stopped.
+
+There is no numerical reference for the shipped model (no ONNX source), so this checks what can
+be checked on the board: finite outputs, the 10 ms deadline and the inference time."""
 
 import argparse
 import fcntl
@@ -31,35 +34,31 @@ def main():
             parser.error("stop the LF runtime before running the NPU reference check")
         os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(20))
         model = Policy(ROOT)
-        rows = json.loads((ROOT / "tests/data/policy_reference.json").read_text())
-        action_errors, hidden_errors, times = [], [], []
+        observations = json.loads((ROOT / "tests/data/policy_observations.json").read_text())["obs"]
+        actions, times = [], []
         gc.collect()
         gc.disable()
         try:
-            for row in rows:
+            for obs in observations:
                 release = time.monotonic()
-                action = model.step(row["obs"])
+                actions.append(model.step(obs))  # raises on a nonfinite action or hidden state
                 times.append(model.last_ms)
-                action_errors.extend(abs(x - y) for x, y in zip(action, row["action"]))
-                hidden_errors.extend(
-                    abs(x - y) for x, y in zip(model.hidden, row["hidden"])
-                )
                 time.sleep(max(0.0, 0.01 - (time.monotonic() - release)))
         finally:
             model.close()
+        flat = [abs(x) for action in actions for x in action]
         report = {
             "scheduler": "SCHED_FIFO 20",
-            "steps": len(rows),
-            "action_max_abs": max(action_errors),
-            "action_mean_abs": statistics.mean(action_errors),
-            "hidden_max_abs": max(hidden_errors),
+            "steps": len(observations),
+            "action_abs_max": max(flat),
             "inference_median_ms": statistics.median(times),
             "inference_max_ms": max(times),
             "deadline_misses": sum(t > 10 for t in times),
             "worst_step": times.index(max(times)),
             "startup_ms": model.startup_ms,
+            "numerical_reference": False,
         }
-        report["passed"] = max(action_errors) < 0.05 and report["deadline_misses"] == 0
+        report["passed"] = report["deadline_misses"] == 0
         args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(json.dumps(report, indent=2) + "\n")
         print(json.dumps(report, indent=2))
