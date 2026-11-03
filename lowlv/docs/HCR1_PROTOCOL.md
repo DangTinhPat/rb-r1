@@ -64,8 +64,9 @@ TELEMETRY nguồn; reply mang epoch, sequence request và mã kết quả.
    E-stop/lỗi driver cục bộ trên ESP cần CLEAR_FAULT sau verified OFF; epoch
    mới không tự xóa hai lỗi này.
 
-LF giữ home 3 s; chạy logic từ 3 s; warm-up model từ 12.5 s; bàn giao từ 13 s
-khi logic đã `Support` và đã có ít nhất 50 lượt warm-up. GRU không reset khi bàn giao.
+LF giữ home 3 s; chạy kế hoạch gập từ 3 s; warm-up model từ 4,775 s; bàn giao từ 5,275 s
+(`warmup_start_s`, `handoff_earliest_s` trong `highlv/config/runtime.json`) khi đã gập xong (`Folded`)
+và đã có ít nhất 50 lượt warm-up. GRU không reset khi bàn giao.
 Không thêm blend giữa output logic/policy vào controller đã đóng gói.
 
 ESP32 vừa reboot có thể gửi HELLO với `epoch=0, hz=200/100, schema=HCR1` để yêu cầu
@@ -116,7 +117,7 @@ Flags:
 | 6 / 64 | lỗi driver |
 
 Ba bit đầu bắt buộc. Bit 5 bắt buộc từ khi warm-up. Nếu chưa có current/torque,
-đặt hai torque bằng 0 và bỏ bit 4; LF chuyển `hip_torque_valid=false` vào V3Controller.
+đặt hai torque bằng 0 và bỏ bit 4; LF bỏ qua torque.
 Không khai báo torque hợp lệ bằng dữ liệu giả.
 
 ## 4. TARGET (0x81): LF → ESP32
@@ -214,7 +215,7 @@ Policy giữ lịch 100 Hz. Một kết quả inference đến sau 10 ms bị b�
 liên tiếp, LF chuyển FAULT. Đây là xử lý jitter của Linux/NPU dùng chung; không hạ
 tần số policy xuống 50 Hz. TTL 20 ms độc lập trên MCU vẫn có hiệu lực nếu LF bị treo.
 
-LF logs thêm lý do, phase đứng dậy, số inference và latency trong
+LF logs thêm lý do, phase (Idle/Folding/Folded), số inference và latency trong
 `/tmp/rb-hybrid-status.json`. STATUS không được dùng để kéo dài TTL motor.
 
 

@@ -450,7 +450,7 @@ class HybridCore:
         if elapsed >= self.config["warmup_start_s"]:
             if not t.flags & p.TARGET_VALID:
                 return [self.fail("missing_applied_target"), self.status()]
-        # The simulator stops on a fall; keep that behaviour instead of automatic rearming.
+        # A fall latches a fault; the robot is never re-armed automatically.
         if self.mode == "MODEL" and -t.gravity[2] / norm < math.cos(math.radians(70)):
             return [self.fail("fall"), self.status()]
         due = frame.stamp >= self.next_infer_stamp

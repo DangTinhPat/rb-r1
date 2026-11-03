@@ -16,7 +16,7 @@ Trình duyệt → HTTP :8082 → Python trên LF → /dev/ttyS2 @ 921600
 
 Đây là **example bench độc lập**, dùng ASCII kế thừa Lumi-Quantum, không phải
 HCR1 và không chạy cùng runtime production hoặc `check_hcr_link.py` trên một UART.
-Không dùng policy, IMU hay logic đứng dậy. Không thay đổi contract HCR1 production.
+Không dùng policy, IMU hay kế hoạch gập. Không thay đổi contract HCR1 production.
 
 ## Chạy trên LF
 

@@ -1,6 +1,6 @@
 # reconect — Runtime hybrid tầng trên của RB-R1
 
-Project chạy trên **Luckfox RV1106** để nhận telemetry từ ESP32, chạy core đứng dậy,
+Project chạy trên **Luckfox RV1106** để nhận telemetry từ ESP32, chạy kế hoạch gập,
 thực hiện inference policy (model fitted22500) và truyền target trở lại MCU qua HCR1. LF chỉ tự
 lập kế hoạch bước gập từ HOME xuống sàn (bộ gập viết bằng C++); việc đứng lên thuộc về model.
 

@@ -8,7 +8,7 @@ Bản ứng viên kế thừa module 3in1 chưa nạp phần cứng; xem
 [kiểm chứng bản kế thừa](MISS_RECOVERY_VALIDATION.md).
 Chi tiết ở [MOTOR_INTEGRATION.md](MOTOR_INTEGRATION.md).
 
-Logic đứng dậy, model và quyết định chuyển pha nằm trên LF. Bản build này không
+Kế hoạch gập, model và quyết định chuyển pha nằm trên LF. Bản build này không
 khởi động `AppV3`, CAN motor hoặc gateway UDP LFG1 của bản nháp.
 Bản nháp còn ở worktree gốc; repository gatewayLF chỉ xuất target hybrid.
 
@@ -240,7 +240,7 @@ hipL,hipR,kneeL,kneeR,wheelL,wheelR từ cùng snapshot đó. Tuổi mẫu chưa
 hoặc timestamp ở tương lai in UINT64_MAX. Feedback phục hồi không ghi đè
 context; CLEAR_FAULT thành công/reboot xóa context. Không thay HCR1/validity.
 
-Ở Kneeling nhả lực, firmware vẫn PING hai khớp trong mỗi batch để đọc encoder;
+Khi LF nhả lực (flags không bật khớp), firmware vẫn PING hai khớp trong mỗi batch để đọc encoder;
 joint-enable=0 chỉ tắt lực, không tắt việc theo dõi vị trí. Xem incident và
 regression trong [MOTOR_INTEGRATION.md](MOTOR_INTEGRATION.md).
 

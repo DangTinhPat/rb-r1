@@ -218,7 +218,7 @@ void peer() {
 int main(int argc,char** argv) {
   if(argc>1 && !std::strcmp(argv[1],"--peer")){peer();return 0;}
 
-  { // Kneeling releases joints while TARGETs continue at 200 Hz. A worker
+  { // A joint release (LF clears the enable flags) while TARGETs continue at 200 Hz. A worker
     // may have a batch on every step, so background polling is not guaranteed.
     for (unsigned flags : {0U,2U}) {
       Rig r;r.home();auto t=r.target();unsigned seq=1;r.run(t,seq);
@@ -263,7 +263,7 @@ int main(int argc,char** argv) {
       }
       for (auto* bus:{&r.left,&r.right}) for (const auto& frame:bus->frames)
         assert(!(frame[2]!=1 && frame[4]==3 && frame[5]==0x1a));
-      // Catching can subsequently re-enable the same joints without losing HOME.
+      // The joints can subsequently be re-enabled without losing HOME.
       t.flags=3;r.run(t,seq);
       assert(r.motor.feedback(r.now).homed);
       for (auto* bus:{&r.left,&r.right}) for (bool on:bus->enabled) assert(on);

@@ -1,5 +1,5 @@
-"""Fold-down planner. The reference rows were captured from the stand-up Folding phase that
-this planner replaced, so the ramp is checked against what the robot used to do."""
+"""Fold-down planner, checked against tests/data/fold_reference.json (the ramp as the removed
+stand-up Folding phase produced it)."""
 
 import json
 from pathlib import Path
@@ -35,8 +35,8 @@ class FoldReferenceTests(unittest.TestCase):
                     self.assertAlmostEqual(got, row[columns[key]], delta=2e-4, msg=f"{where} {key}")
                 self.assertEqual(phase, FOLDED if tick >= DATA["fold_complete_tick"] else FOLDING, where)
                 self.assertEqual(folded, tick >= DATA["fold_complete_tick"], where)
-                # The old code disabled the wheels for the first tick only (enables 1, then 3):
-                # a 5 ms wheel off/on glitch at the start of the fold. The planner keeps HOME's 3.
+                # The reference has enables=1 at tick 0 (a one-tick wheel off/on glitch). The
+                # planner keeps legs+wheels enabled from the first tick, as in HOME.
                 self.assertEqual(flags, FLAGS)
                 self.assertEqual(row[columns["enables"]], 1 if tick == 0 else 3)
 

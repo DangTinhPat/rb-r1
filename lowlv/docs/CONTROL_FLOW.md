@@ -477,7 +477,7 @@ Hệ quả:
    `GatewayCore::receive` chỉ kiểm lúc ARM rằng *feedback* gần HOME (±0,15 rad).
    `makeBatch` chỉ kiểm miền khớp và tốc độ bánh. Một TARGET nhảy từ 0,5 sang
    2,0 rad trong miền hợp lệ vẫn được gửi với kp = 10. An toàn về quỹ đạo nằm ở
-   LF (nó giữ HOME 3 s đầu, rồi đứng dậy bằng quỹ đạo). Đây là hệ quả của nguyên
+   LF (nó giữ HOME 3 s đầu, rồi gập bằng quỹ đạo). Đây là hệ quả của nguyên
    tắc "không clamp ngầm", nhưng cũng có nghĩa ESP không tự chặn được một LF gửi
    bước nhảy lớn trong miền. Mọi thay đổi nhằm "thêm giới hạn bước nhảy" cần
    đánh giá lại hợp đồng HCR1 và phải sửa cả hai tầng.

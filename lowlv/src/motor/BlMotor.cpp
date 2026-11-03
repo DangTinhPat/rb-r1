@@ -720,7 +720,7 @@ void BlMotorWorker::step() noexcept {
         } else {
           if (on_[j]) ok=torque(j,false);
           // Released joints still need real encoder feedback. Continuous
-          // batches can leave no background-poll slot (notably Kneeling).
+          // batches can leave no background-poll slot (notably while LF releases the joints).
           // PING reads position without enabling torque or writing a target.
           if (ok && allowed(r,true)) ok=transact(j,1,nullptr,0);
           else ok=false;

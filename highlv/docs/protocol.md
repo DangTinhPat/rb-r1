@@ -159,8 +159,7 @@ Mode: 0 WAIT_LINK, 1 DISARMED, 2 HOME, 3 STANDUP, 4 WARMUP, 5 MODEL, 6 FAULT.
 LF vẫn giữ telemetry timeout 30 ms. Cửa sổ ACK thích ứng từ 30 ms tới mức trần
 60 ms trong `config/runtime.json`: runtime học latency ACK đầu-cuối từ các
 `applied_seq` tiến triển gần nhất (p90 của tối đa 32 mẫu, cộng biên 8 ms bù jitter;
-chưa có mẫu thì dùng mức sàn). Không còn nới thêm theo pha: phần chờ bánh bật lại của pha
-Kneeling cũ đã bị xóa. Timeout ghi
+chưa có mẫu thì dùng mức sàn). Cửa sổ không nới thêm theo pha. Timeout ghi
 sequence, tuổi ACK và cửa sổ đã chọn khi hết hạn. Cơ chế không đổi TTL TARGET
 20 ms, source age hay yêu cầu ACK từ cả hai bus. Trạng thái LF công bố cửa sổ,
 tuổi ACK và số mẫu latency trong `ack_diagnostics`.

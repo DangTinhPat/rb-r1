@@ -393,8 +393,8 @@ def main():
                                 ]
                             if frame.kind == ENCODER_HOME_ACK:
                                 last_status = 0.0
-                            # Send each reply as soon as it exists: batching behind later
-                            # frames made the newest target wait for older samples.
+                            # Send each reply as soon as it exists, so a later frame in the same
+                            # read never delays an earlier target.
                             writer.add(reply)
                             writer.flush()
                             sent_ms = (time.monotonic() - read_at) * 1000

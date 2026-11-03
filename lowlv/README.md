@@ -5,7 +5,7 @@ Firmware chạy trên ESP32-S3 (N16R8), đóng vai **cầu nối giữa Luckfox 
 ```
 Luckfox (LF)  ──UART0, giao thức HCR1, 921600 baud──►  ESP32-S3  ──►  6 động cơ BL4012 (2 bus UART)
 (chạy model,                                             │
- logic đứng dậy)                                         └──◄── IMU MPU6500 (SPI)
+ kế hoạch gập)                                           └──◄── IMU MPU6500 (SPI)
 ```
 
 - LF gửi **4 góc khớp mục tiêu + 2 tốc độ bánh**. Không có lệnh mô-men.
