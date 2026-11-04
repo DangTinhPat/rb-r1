@@ -34,6 +34,7 @@ gatewayLF/
 ├── third_party/bl4012e/  Module bus joint_bus.c lấy từ dự án BL4012e/3in1
 ├── scripts/              Script PlatformIO chạy lúc build
 ├── tools/                Công cụ chạy trên laptop hoặc LF (không nằm trong firmware)
+├── examples/             Bốn firmware kiểm tra riêng (UART, IMU, motor, OTA), build độc lập với firmware chính
 ├── tests/                Test chạy trên máy host, không cần phần cứng
 └── docs/                 Tài liệu chi tiết
 ```
@@ -69,12 +70,20 @@ Hai thư mục này có cùng bốn nhóm con. Mỗi nhóm có header trong `inc
   - `check_hcr_uart.py`: kiểm tra UART giữa LF và ESP ở chế độ DISABLED.
   - `hcr_uart_peer.py`, `hcr_protocol.py`: giả lập phía LF để test.
   - `decode_motor_wave.py`: giải mã sóng bus motor.
+- **`examples/`**: bốn firmware PlatformIO **độc lập**, mỗi cái có `platformio.ini` và README riêng. Không dùng chung code hay build với firmware chính, và không phải firmware sản xuất.
+  - `check_hcr_link/`: kiểm dây UART LF ↔ ESP bằng văn bản thuần, LF gửi `hello`, ESP trả `im here` (921600 8N1, không dùng frame HCR1, không điều khiển motor). Phía LF là `highlv/examples/check_hcr_link.py`.
+  - `check_imu/`: `firmware/` đọc MPU6500 thô 500 Hz rồi phát `$IMU,...` qua TCP 8023 hoặc UART0; `gui/imu_plane.py` vẽ máy bay xoay theo dữ liệu để kiểm hướng trục và bộ lọc.
+  - `check_motor/`: bench motor BL4012 chuyển từ `lumi-quantum/examples/check_motor`, có `firmware/`, `tests/`, `tools/ota_upload.py`. Dùng giao thức văn bản riêng (`HELLO`, `P`, `C <seq> ...`), **không phải HCR1**. Phía LF là `highlv/examples/check_motor`; hai phía không import hay build lẫn nhau. Mặc định chỉ build và test, bật motor thật cần yêu cầu và xác nhận OFF.
+  - `check_ota/`: kiểm Wi-Fi, OTA và truyền nhận hai chiều (`henlo`) với máy tính, không điều khiển gì.
+  - File mật khẩu thật (`wifi_secrets.h`, `secrets.local*.ini`, `bench_secrets.h`) bị `examples/.gitignore` bỏ qua; chỉ commit các file `*.example.*`.
 - **`tests/`**: gồm các test và mock bus, build có ASan/UBSan.
   - `check_gateway.py`: test `GatewayCore`, parser, console.
   - `check_bl_motor.py`: test logic motor với bus giả.
   - `check_inherited_bus.py`: so khớp module bus với bản gốc.
   - `test_*.py`: test công cụ (OTA, giải mã sóng).
 - **`docs/`**:
+  - `ESP_BLOCK_DIAGRAM.md`: hai sơ đồ khối ESP32-S3 (tổng quan và luồng chi tiết), kèm bảng khối nào nằm ở file nào. Ảnh và nguồn HTML nằm trong `docs/assets/`.
+  - `CONTROL_FLOW.md`: luồng điều khiển từ lúc nhận `TARGET` tới driver BL4012 (cổng kiểm tra, đổi rad sang xung, ACK, hạn 20 ms, latch lỗi).
   - `MCU.md`: mô tả tổng quan MCU và các lệnh console.
   - `HCR1_PROTOCOL.md`: định dạng frame.
   - `MOTOR_INTEGRATION.md`: ghép driver motor.
@@ -112,4 +121,4 @@ python3 -m pytest -q tests
 
 ## Đọc thêm
 
-[Mô tả MCU](docs/MCU.md) · [Giao thức HCR1](docs/HCR1_PROTOCOL.md) · [Ghép driver motor](docs/MOTOR_INTEGRATION.md) · [OTA](docs/OTA.md) · [Kiểm chứng bản kế thừa](docs/MISS_RECOVERY_VALIDATION.md)
+[Sơ đồ khối](docs/ESP_BLOCK_DIAGRAM.md) · [Luồng điều khiển](docs/CONTROL_FLOW.md) · [Mô tả MCU](docs/MCU.md) · [Giao thức HCR1](docs/HCR1_PROTOCOL.md) · [Ghép driver motor](docs/MOTOR_INTEGRATION.md) · [OTA](docs/OTA.md) · [Kiểm chứng bản kế thừa](docs/MISS_RECOVERY_VALIDATION.md)
