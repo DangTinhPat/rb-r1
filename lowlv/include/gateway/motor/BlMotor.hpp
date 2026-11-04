@@ -125,6 +125,10 @@ struct MotorFaultContext {
   BusError bus_error=BusError::None;
   BusTrace trace{};
 };
+// Reply-latency bins in microseconds: <1, <2, <3, <5, <9, <20 ms, >=20 ms. The edges follow the joint (3 ms) and
+// wheel (9 ms) reply windows and the 20 ms lease.
+inline constexpr std::array<std::uint32_t,6> kReplyBinEdgesUs{{1000,2000,3000,5000,9000,20000}};
+inline constexpr std::size_t kReplyBins = kReplyBinEdgesUs.size()+1;
 struct MotorLegState {
   bool configured = false, off = false, prepared = false, wheel_ready = false;
   std::uint32_t generation = 0, reset_generation = 0;
@@ -150,6 +154,15 @@ struct MotorLegState {
   std::int32_t feedback_previous = 0, feedback_received = 0;
   std::uint64_t feedback_gap_us = 0, wheel_gap_max_us = 0;
   bool feedback_active = false;
+  // Diagnostics only; nothing here gates control. Driver reply latency per device (hip, second joint, wheel):
+  // end of our echo to the last reply byte, successful replies only. It is what the ESP saw, so a worker held up by a
+  // higher-priority task or by the other bus's interrupts-off transmit also lands in a slow bin.
+  std::array<std::array<std::uint32_t,kReplyBins>,3> reply_hist{};
+  std::array<std::uint32_t,3> reply_max_us{};
+  // Wheel Present Load (register 0x24, raw s16): latest value and largest magnitude since the last reset.
+  std::int16_t wheel_load = 0;
+  std::uint16_t wheel_load_peak = 0;
+  std::uint32_t wheel_load_samples = 0;
 };
 struct BlMotorDiagnostics {
   bool homed = false, active = false, in_flight = false;

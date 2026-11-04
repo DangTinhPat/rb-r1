@@ -19,6 +19,18 @@ bool quantize(float v, std::int32_t lo, std::int32_t hi, std::int32_t& out) {
   if (!std::isfinite(v) || v<lo || v>hi) return false;
   out=static_cast<std::int32_t>(std::lround(v)); return out>=lo && out<=hi;
 }
+// Diagnostics only, after a successful reply: echo end to last reply byte, from the bus trace.
+void recordReplyLatency(MotorLegState& s, const BlMotorConfig& c, std::uint8_t id, const BusTrace& t) {
+  if (!t.rx_count || t.total_us<t.echo_us) return;
+  unsigned device=3;
+  for (unsigned i=0;i<3;++i) if (c.id[i]==id) device=i;
+  if (device>=3) return;
+  const std::uint32_t us=t.total_us-t.echo_us;
+  std::size_t bin=0;
+  while (bin<kReplyBinEdgesUs.size() && us>=kReplyBinEdgesUs[bin]) ++bin;
+  ++s.reply_hist[device][bin];
+  s.reply_max_us[device]=std::max(s.reply_max_us[device],us);
+}
 }
 
 std::size_t motorPacket(std::uint8_t id, std::uint8_t instruction,
@@ -418,6 +430,7 @@ bool BlMotorWorker::requestBus(BusFormat fmt, std::uint8_t id, std::uint8_t inst
   ++state_.transactions;
   const auto started=bus_.now();
   const bool ok=bus_.request(fmt,id,inst,p,n,read,reply);
+  if (ok) recordReplyLatency(state_,owner_.config(),id,bus_.trace());
   if (guard_active_) {
     state_.active_io_us=static_cast<std::uint32_t>(std::min<std::uint64_t>(bus_.now()-started,UINT32_MAX));
     state_.active_io_max_us=std::max(state_.active_io_max_us,state_.active_io_us);
@@ -569,6 +582,11 @@ bool BlMotorWorker::wheelRead() noexcept {
   previous_wheel_=pos; state_.stamp[2]=now;
   state_.raw_q[2]=wheel_counts_*(2*pi/1024.F);
   state_.raw_qd[2]=static_cast<std::int16_t>(u16(r.data.data()+2))*rpm_rad;
+  // Present Load is the third field of the same 6-byte read; kept for diagnosis only, never used for control.
+  state_.wheel_load=static_cast<std::int16_t>(u16(r.data.data()+4));
+  state_.wheel_load_peak=std::max(state_.wheel_load_peak,
+      static_cast<std::uint16_t>(std::abs(static_cast<int>(state_.wheel_load))));
+  ++state_.wheel_load_samples;
   owner_.publishSample(side_,2,state_);
   return true;
 }

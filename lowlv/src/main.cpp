@@ -437,6 +437,17 @@ void status() {
       side?"R":"L",bs.timeout,bs.echo,bs.frame,bs.partial,bs.late,bs.sync,bs.quiet,bs.aborted,
       m.retries,m.recovered_transactions,m.skipped_writes);
     printLine(line);
+    static constexpr const char* kDevice[3]={"hip","knee","wheel"};
+    for (unsigned k=0;k<3;++k) {
+      const auto& h=m.reply_hist[k];
+      std::snprintf(line,sizeof line,
+        "BUS_LATENCY side=%s dev=%s max_us=%u bins_ms[<1 <2 <3 <5 <9 <20 >=20]=[%u %u %u %u %u %u %u]\n",
+        side?"R":"L",kDevice[k],m.reply_max_us[k],h[0],h[1],h[2],h[3],h[4],h[5],h[6]);
+      printLine(line);
+    }
+    std::snprintf(line,sizeof line,"WHEEL_LOAD side=%s raw=%d peak=%u samples=%u\n",
+        side?"R":"L",m.wheel_load,static_cast<unsigned>(m.wheel_load_peak),m.wheel_load_samples);
+    printLine(line);
     const auto& trace=m.failure_trace;
     char tx_hex[97]{},echo_hex[97]{};
     for (unsigned j=0;j<trace.tx_count;++j) std::snprintf(tx_hex+2*j,3,"%02x",trace.tx[j]);

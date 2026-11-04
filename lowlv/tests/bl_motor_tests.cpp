@@ -31,9 +31,13 @@ struct FakeBus final:MotorBus {
   std::uint8_t status=0;
   std::uint16_t gain_cap=5000;
   std::uint32_t latency=50;
+  std::uint32_t reply_us=0;   // simulated echo-end to reply-end time reported in the bus trace
+  std::int16_t wheel_load=0;  // Present Load field of the wheel 0x24 read
+  BusTrace last_trace{};
   explicit FakeBus(std::uint64_t& time):clock(time) {}
   std::uint64_t now() const noexcept override { return clock; }
   BusError lastError() const noexcept override { return error; }
+  BusTrace trace() const noexcept override { return last_trace; }
   void setWheelWriteReplies(bool enabled) noexcept override { wheel_write_replies=enabled; }
   bool request(BusFormat fmt,std::uint8_t id,std::uint8_t inst,const std::uint8_t* p,
                std::size_t n,std::size_t read,BusReply& out) noexcept override {
@@ -75,11 +79,13 @@ struct FakeBus final:MotorBus {
     if (read && p[0]==0x24) {
       data[0]=wheel_pos&255;data[1]=wheel_pos>>8;
       data[2]=wheel_rpm&255;data[3]=(std::uint16_t(wheel_rpm)>>8)&255;
+      data[4]=wheel_load&255;data[5]=(std::uint16_t(wheel_load)>>8)&255;
     }
     unsigned sum=0;for(unsigned i=2;i<count-1;++i)sum+=rx[i];
     rx[count-1]=~sum;if(corrupt)rx[count-1]^=1;
     const bool ok=motorReply(fmt,id,inst,n?p[0]:0,n+2,rx.data(),count,read,out);
     if (!ok) error=BusError::ReplyInvalid;
+    else { last_trace={};last_trace.echo_us=300;last_trace.total_us=300+reply_us;last_trace.rx_count=count; }
     return ok;
   }
   const std::vector<std::uint8_t>& last(unsigned id,unsigned address) const {
@@ -891,7 +897,37 @@ int main(int argc,char** argv) {
   { BlMotorConfig c;c.knee_crank_coupling=.5F;assert(!validMotorConfig(c));
     c={};c.knee_profile[1].kd=std::numeric_limits<float>::quiet_NaN();assert(!validMotorConfig(c));
   }
+  { // Reply latency and wheel load are diagnostics: counted per device from successful replies, never gating control.
+    const auto total=[](const std::array<std::uint32_t,kReplyBins>& h) {
+      std::uint32_t s=0;for(auto v:h)s+=v;return s;
+    };
+    Rig r;
+    const auto idle_hip=r.motor.diagnostics().leg[0].reply_hist[0];
+    assert(total(idle_hip)>0 && idle_hip[0]==total(idle_hip)); // reply_us=0 falls in the first bin
+    r.left.reply_us=2500;r.right.reply_us=400;r.left.wheel_load=-1234;
+    r.idle();
+    const auto d=r.motor.diagnostics();
+    assert(d.error==MotorError::None && d.leg[0].error==MotorError::None);
+    assert(d.leg[0].reply_hist[0][2]>0 && d.leg[0].reply_hist[2][2]>0); // 2.5 ms is in [2,3) ms
+    assert(d.leg[0].reply_max_us[0]==2500 && d.leg[0].reply_max_us[2]==2500);
+    assert(d.leg[1].reply_max_us[0]==400 && d.leg[1].reply_hist[0][2]==0);
+    assert(d.leg[0].wheel_load==-1234 && d.leg[0].wheel_load_peak==1234 && d.leg[0].wheel_load_samples>0);
+    assert(d.leg[1].wheel_load==0 && d.leg[1].wheel_load_peak==0);
+    // A bin edge belongs to the upper bin; the last bin is open ended.
+    const std::array<std::pair<std::uint32_t,unsigned>,4> edges{{{999,0},{1000,1},{8999,4},{20000,6}}};
+    for (const auto& edge:edges) {
+      Rig e;const auto base=e.motor.diagnostics().leg[0].reply_hist[0];
+      e.left.reply_us=edge.first;e.idle();
+      assert(e.motor.diagnostics().leg[0].reply_hist[0][edge.second]>base[edge.second]);
+    }
+    // A reply that fails validation is not counted as a latency sample.
+    Rig f;const auto before=total(f.motor.diagnostics().leg[0].reply_hist[0]);
+    f.left.corrupt=true;f.now+=5000;f.workers();
+    assert(f.motor.diagnostics().leg[0].error!=MotorError::None); // a transaction really ran
+    assert(total(f.motor.diagnostics().leg[0].reply_hist[0])==before);
+  }
   std::puts("PASS: Lumi mapping/gains, direct-knee and crank adapters, verified configuration/enable, no-write-reply wheel");
+  std::puts("PASS: reply-latency histogram and wheel load are recorded as diagnostics only");
   std::puts("PASS: bounded retry, first failure retained, cancellation/expiry and wheel dedup/keepalive/freshness");
   gatewayIntegration();
   gatewayIntegration(true);

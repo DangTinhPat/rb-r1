@@ -203,6 +203,26 @@ bỏ WRITE còn79byte/bus. RPM thay đổi được gửi ngay; không nhập sl
 `BUS_RECOVERY` thống kê raw errors, late/sync, retries/recovered và skipped writes;
 first-failure vẫn giữ khi retry thành công, không tự mang nghĩa local_fault.
 
+`BUS_LATENCY` và `WHEEL_LOAD` (console `STATUS`) chỉ để chẩn đoán, không tham gia
+điều khiển và không thêm giao dịch bus nào:
+
+- `BUS_LATENCY side=… dev=hip|knee|wheel` đếm thời gian trả lời của driver, tính từ
+  lúc echo của khung vừa gửi kết thúc tới byte cuối của phản hồi (`total_us − echo_us`
+  trong trace của `joint_bus.c`). Chỉ phản hồi hợp lệ được tính. Bảy ngăn:
+  <1, <2, <3, <5, <9, <20 ms và ≥20 ms (`kReplyBinEdgesUs`). `max_us` là giá trị lớn
+  nhất từng thấy. Bộ đếm reset cùng worker khi `reset_generation` đổi.
+- Số đo là điều ESP quan sát được, không phải thời gian xử lý bên trong driver.
+  Worker bị task ưu tiên cao hơn chen vào, hoặc bị khung gửi của bus bên kia tắt ngắt,
+  cũng rơi vào ngăn chậm. Muốn kết luận driver chậm, đối chiếu với `service_max_us`,
+  `missed_ticks` và `uart_gap_max_us`.
+- `WHEEL_LOAD` là trường Present Load (s16 thô, thanh ghi `0x24`) của chính lần đọc bánh
+  vẫn thực hiện trong mỗi batch: giá trị mới nhất, độ lớn lớn nhất (`peak`) và số mẫu.
+  Đơn vị chưa được xác minh. Dùng để so sánh tương đối khi bánh bị giữ hay chạy rảnh.
+- Mỗi `MotorLegState` tăng từ 560 lên 664 byte; `BlMotorDiagnostics` từ 1128 lên 1336
+  byte (đo bằng biên dịch trên host). Chúng được sao chép dưới vùng tắt ngắt ở cuối
+  mỗi bước worker và 10 lần mỗi giây vào hàng đợi báo cáo; chưa đo ảnh hưởng thời gian
+  hay độ dư ngăn xếp của `hcr-service` trên phần cứng.
+
 Cấu hình nằm trong `include/gateway/motor/BlMotor.hpp` (`BlMotorConfig`). Sign và
 limit/gain không nhận thay đổi trong lúc ARM; chỉnh cấu hình cần build lại.
 Không đổi ID/baud của driver. Response level của khớp được đưa về2 và đọc lại
